@@ -53,25 +53,27 @@ jobs:
             find . -maxdepth 4 -name "slider_dist"
           fi
 
-      - name: 6. 自动寻找目标并使用 Kleaf 编译
+      - name: 6. 使用 Kleaf 专用脚本编译内核
         working-directory: ./kernel-workspace
         run: |
-          echo "正在搜索正确的编译目标..."
-          # 搜索包含 slider_dist 的具体路径
-          TARGET_PATH=$(find . -name "BUILD" -exec grep -l "slider_dist" {} + | sed 's/.\///' | sed 's/\/BUILD//' | head -n 1)
+          # 1. 尝试使用官方推荐的入口脚本，它会自动处理复杂的 Bazel 依赖
+          # Pixel 6 的编译代号在 Android 14/15/16 统一为 slider
           
-          if [ -z "$TARGET_PATH" ]; then
-            echo "❌ 无法自动定位 slider_dist，尝试列出所有可用目标..."
-            ./tools/bazel query //... | grep "_dist" || true
-            echo "尝试使用通用 GKI 目标作为备选..."
-            FULL_TARGET="//common:kernel_aarch64_dist"
+          # 先赋予执行权限
+          chmod +x build/kernel/kleaf/bazel.sh || true
+          
+          # 2. 执行编译命令
+          # 我们不再手动传递复杂的内存参数，让 Kleaf 自动管理
+          # 如果你的分支里没有 build_slider.sh，我们直接调用 bazel
+          
+          if [ -f "build_slider.sh" ]; then
+            echo "✅ 找到 build_slider.sh，启动专用脚本编译..."
+            ./build_slider.sh
           else
-            FULL_TARGET="//$TARGET_PATH:slider_dist"
-            echo "✅ 自动定位到目标: $FULL_TARGET"
+            echo "⚠️ 未找到 build_slider.sh，使用底层的 bazel 编译..."
+            # 修正后的内存参数语法
+            ./tools/bazel run --local_resources=memory=HOST_RAM*.8,cpu=HOST_CPUS //common:kernel_aarch64_dist -- --dist_dir=out/dist
           fi
-
-          # 执行编译 (修正了内存参数并使用自动寻找到的目标)
-          ./tools/bazel run --local_resources=memory=12288,cpu=4 $FULL_TARGET -- --dist_dir=out/dist
 
       - name: 7. 上传编译镜像 (Artifacts)
         uses: actions/upload-artifact@v4
