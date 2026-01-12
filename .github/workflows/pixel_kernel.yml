@@ -1,0 +1,56 @@
+name: Build Pixel 6 Mainline Kernel 6.12
+
+on:
+  workflow_dispatch: # 允许手动点击按钮触发编译
+
+jobs:
+  build_kernel:
+    runs-on: ubuntu-latest
+    # 编译内核非常耗时，设置 6 小时超时限制
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. 腾出磁盘空间
+        run: |
+          echo "正在清理环境以释放磁盘空间..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: 2. 安装必要依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs repo
+          # 确保 git 配置正确
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: 3. 安装并配置 Repo 工具
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          # 将 ~/bin 添加到全局 PATH，确保后续步骤都能直接使用 repo 命令
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: 4. 同步内核源码 (gs-android16-6.12-gs101)
+        run: |
+          # 必须先创建工作目录
+          mkdir kernel-workspace && cd kernel-workspace
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101 --depth=1
+          # 同步可能需要 20-40 分钟
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+          echo "WORKSPACE_PATH=$(pwd)" >> $GITHUB_ENV
+
+      - name: 5. 验证项目结构
+        working-directory: ./kernel-workspace
+        run: |
+          ls -F
+          # 检查编译 6.12 所需的关键目录
+          if [ -d "private/devices/google/raviole" ]; then
+            echo "✅ 找到 Pixel 6 (raviole) 专用驱动目录"
+          else
+            echo "❌ 警告: 未在 private 目录找到驱动，搜索实际位置:"
+            find . -maxdepth 4 -name "slider_dist"
+          fi
+
+      - name: 6. 使用 Kleaf (Bazel) 编译内核
