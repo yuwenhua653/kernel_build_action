@@ -1,43 +1,36 @@
-name: CI
-on:
-  push:
-    branches: main
-    paths:
-      - '.github/workflows/main.yml'
-      - 'action.yml'
-
-  pull_request:
-  workflow_dispatch:
+name: Build Pixel 6 Mainline Kernel
+on: [workflow_dispatch]
 
 jobs:
-  ci-test:
-    name: Build Kernel
-    strategy:
-      fail-fast: false
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@v6
-      with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+      - name: 腾出磁盘空间 (最重要，否则 100% 报错)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-    - name: Build Kernel
-      uses: ./
-      with:
-          kernel-url: https://github.com/AcmeUI-Devices/android_kernel_xiaomi_cas
-          kernel-dir: msm-4.19
-          kernel-branch: taffy
-          config: cas_defconfig
-          arch: arm64
-          aosp-gcc: true
-          aosp-clang: true
-          ksu: true
-          ksu-version: main
-          android-version: 12
-          aosp-clang-version: r383902
-          disable-lto: true
-          anykernel3: true
+      - name: 安装 Repo 工具
+        run: |
+          mkdir ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          export PATH=$PATH:~/bin
+
+      - name: 同步内核源码 (6.12 分支)
+        run: |
+          export PATH=$PATH:~/bin
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101 --depth=1
+          repo sync -c -j8 --no-tags --no-clone-bundle
+
+      - name: 使用 Kleaf 编译内核
+        run: |
+          # 编译 Pixel 6 的目标产物 (代号 slider)
+          ./tools/bazel run //private/devices/google/raviole:slider_dist
+
+      - name: 上传镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel6-6.12-Kernel
+          path: out/slider/dist/*.img
