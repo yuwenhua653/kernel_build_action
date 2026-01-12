@@ -38,13 +38,12 @@ jobs:
       - name: 5. 使用 Kleaf (Bazel) 编译
         working-directory: ./kernel-workspace
         run: |
-          # 5.10 分支的 Kleaf 目标非常稳定
-          # 使用分行参数确保 Bazel 解析成功
+          # 针对旧版 Bazel 的兼容写法
+          # 直接使用 --jobs 限制并发数是防止 OOM（内存溢出）最有效的方法
+          # GitHub Actions 虚拟机通常为 2 核，设为 2 可确保稳定
           ./tools/bazel run \
-            --local_resources=memory=HOST_RAM*.7 \
-            --local_resources=cpu=HOST_CPUS \
+            --jobs=2 \
             //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
-
       - name: 6. 上传编译产物
         uses: actions/upload-artifact@v4
         with:
