@@ -1,4 +1,4 @@
-name: Build Pixel 6 Mainline 6.12 GKI
+name: Build Pixel 6 Mainline Branch Kernel
 
 on:
   workflow_dispatch:
@@ -6,12 +6,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 400
+
     steps:
-      - name: 1. 释放磁盘空间
+      - name: 1. 清理磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
 
-      - name: 2. 环境准备
+      - name: 2. 安装环境
         run: |
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs repo
@@ -25,31 +28,28 @@ jobs:
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 4. 同步主线源码并切换到 6.12 Tag
+      - name: 4. 同步 gs-android-gs-raviole-mainline 分支
         run: |
           mkdir kernel-workspace && cd kernel-workspace
-          # 使用 android-mainline 清单，这是获取 6.12 最正确的路径
-          repo init -u https://android.googlesource.com/kernel/manifest -b android-mainline --depth=1
+          # 这是你指定的官方主线开发分支
+          git clone --branch https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
           repo sync -c -j8
-          
-          # 进入 common 目录切换到你要求的 6.12 标签
-          cd common
-          git fetch --tags
-          git checkout android-mainline-6.12
-          cd ..
 
-      - name: 5. 编译 GKI 6.12 核心
+      - name: 5. 验证并编译
         working-directory: ./kernel-workspace
         run: |
-          # 自动寻找 bazel 路径，防止不同分支路径不一
-          BAZEL_BIN=$(find . -name "bazel" -type f -executable | head -n 1)
-          echo "使用 Bazel 路径: $BAZEL_BIN"
-          
-          # 运行编译：这次使用最稳的 aarch64 目标
-          $BAZEL_BIN run --jobs=2 //common:kernel_aarch64_dist -- --dist_dir=out/dist
+          # 针对该分支，直接使用官方文档推荐的 slider_dist 目标
+          ./tools/bazel run \
+            --local_resources=memory=HOST_RAM*.7,cpu=HOST_CPUS \
+            //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
 
       - name: 6. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-GKI-6.12-Kernel
-          path: kernel-workspace/out/dist/boot.img
+          name: Pixel6-Mainline-Kernel
+          path: |
+            kernel-workspace/out/dist/boot.img
+            kernel-workspace/out/dist/dtbo.img
+            kernel-workspace/out/dist/vendor_boot.img
+            kernel-workspace/out/dist/vendor_kernel_boot.img
+            kernel-workspace/out/dist/initramfs.img
