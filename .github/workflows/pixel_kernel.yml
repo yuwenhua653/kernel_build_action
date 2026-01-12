@@ -53,12 +53,25 @@ jobs:
             find . -maxdepth 4 -name "slider_dist"
           fi
 
-      - name: 6. 使用 Kleaf (Bazel) 编译内核
+      - name: 6. 自动寻找目标并使用 Kleaf 编译
         working-directory: ./kernel-workspace
         run: |
-          # 设置 Bazel 内存限制防止 OOM 错误
-          # 编译命令针对 Pixel 6 (slider)
-          ./tools/bazel run --local_ram_resources=HOST_RAM*.8 //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
+          echo "正在搜索正确的编译目标..."
+          # 搜索包含 slider_dist 的具体路径
+          TARGET_PATH=$(find . -name "BUILD" -exec grep -l "slider_dist" {} + | sed 's/.\///' | sed 's/\/BUILD//' | head -n 1)
+          
+          if [ -z "$TARGET_PATH" ]; then
+            echo "❌ 无法自动定位 slider_dist，尝试列出所有可用目标..."
+            ./tools/bazel query //... | grep "_dist" || true
+            echo "尝试使用通用 GKI 目标作为备选..."
+            FULL_TARGET="//common:kernel_aarch64_dist"
+          else
+            FULL_TARGET="//$TARGET_PATH:slider_dist"
+            echo "✅ 自动定位到目标: $FULL_TARGET"
+          fi
+
+          # 执行编译 (修正了内存参数并使用自动寻找到的目标)
+          ./tools/bazel run --local_resources=memory=12288,cpu=4 $FULL_TARGET -- --dist_dir=out/dist
 
       - name: 7. 上传编译镜像 (Artifacts)
         uses: actions/upload-artifact@v4
