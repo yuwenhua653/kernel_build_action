@@ -54,3 +54,20 @@ jobs:
           fi
 
       - name: 6. 使用 Kleaf (Bazel) 编译内核
+        working-directory: ./kernel-workspace
+        run: |
+          # 设置 Bazel 内存限制防止 OOM 错误
+          # 编译命令针对 Pixel 6 (slider)
+          ./tools/bazel run --local_ram_resources=HOST_RAM*.8 //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
+
+      - name: 7. 上传编译镜像 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel6-Mainline-6.12-Images
+          path: |
+            kernel-workspace/out/dist/boot.img
+            kernel-workspace/out/dist/dtbo.img
+            kernel-workspace/out/dist/vendor_boot.img
+            kernel-workspace/out/dist/initramfs.img
+            kernel-workspace/out/dist/vendor_kernel_boot.img
+          if-no-files-found: warn
