@@ -28,11 +28,11 @@ jobs:
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 4. 同步内核源码 (6.6 稳定开发分支)
+- name: 4. 同步内核源码 (6.6 分支)
         run: |
           mkdir kernel-workspace && cd kernel-workspace
-          # 使用 Pixel 6 专属的 6.6 Android 15 分支
-          repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-6.6-android15 --depth=1
+          # 使用更通用的 6.6 分支，确保能找到远程引用
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android15-6.6 --depth=1
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
 
       - name: 5. 验证项目结构
