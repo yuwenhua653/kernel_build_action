@@ -1,4 +1,4 @@
-name: Build Pixel 6 Mainline Branch Kernel
+name: Build Pixel 6 Stable Kernel 5.10
 
 on:
   workflow_dispatch:
@@ -6,52 +6,51 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 400
+    timeout-minutes: 300
 
     steps:
-      - name: 1. 清理磁盘空间
+      - name: 1. 释放磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h
 
-      - name: 2. 安装环境
+      - name: 2. 环境依赖准备
         run: |
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs repo
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
 
-      - name: 3. 安装 Repo
+      - name: 3. 安装 Repo 工具
         run: |
           mkdir -p ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 4. 同步 gs-android-gs-raviole-mainline 分支
+      - name: 4. 同步 5.10 稳定分支源码
         run: |
           mkdir kernel-workspace && cd kernel-workspace
-          # 这是你指定的官方主线开发分支
-          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
+          # 这是 Pixel 6 最完整、最稳定的 Android 14 生产级分支
+          repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-5.10-android14 --depth=1
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
 
-      - name: 5. 验证并编译
+      - name: 5. 使用 Kleaf (Bazel) 编译
         working-directory: ./kernel-workspace
         run: |
-          # 针对该分支，直接使用官方文档推荐的 slider_dist 目标
-          # 修正：将参数完全拆开，并使用 --ram_utilization_factor 这种更稳定的 Kleaf 方式
+          # 5.10 分支的 Kleaf 目标非常稳定
+          # 使用分行参数确保 Bazel 解析成功
           ./tools/bazel run \
             --local_resources=memory=HOST_RAM*.7 \
             --local_resources=cpu=HOST_CPUS \
             //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
 
-      - name: 6. 上传产物
+      - name: 6. 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-Mainline-Kernel
+          name: Pixel6-Kernel-5.10-Stable
           path: |
             kernel-workspace/out/dist/boot.img
             kernel-workspace/out/dist/dtbo.img
             kernel-workspace/out/dist/vendor_boot.img
-            kernel-workspace/out/dist/vendor_kernel_boot.img
             kernel-workspace/out/dist/initramfs.img
