@@ -1,4 +1,4 @@
-name: Build Pixel 6 Mainline Branch Kernel
+name: Build Kernel 6.12 (Direct Git)
 
 on:
   workflow_dispatch:
@@ -6,50 +6,42 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 400
-
     steps:
-      - name: 1. 清理磁盘空间
+      - name: 1. 释放磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          df -h
 
       - name: 2. 安装环境
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs repo
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3
+          # 编译 6.12 需要最新的交叉编译器
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: 3. 安装 Repo
+      - name: 3. 直接克隆 6.12 源码
         run: |
-          mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
+          # 直接拉取你指定的那个 Tag，深度 1 节省空间
+          git clone --branch android-mainline-6.12 https://android.googlesource.com/kernel/common --depth=1 kernel-612
 
-      - name: 4. 同步 gs-android-gs-raviole-mainline 分支
+      - name: 4. 传统方式编译 (非 Bazel)
+        working-directory: ./kernel-612
         run: |
-          mkdir kernel-workspace && cd kernel-workspace
-          # 这是你指定的官方主线开发分支
-          git clone --branch https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
-          repo sync -c -j8
+          # 由于没有 repo 就没有 Kleaf 环境，我们回归传统的内核编译方式
+          # 这种方式最稳，不依赖 Google 复杂的 Bazel 规则
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # 1. 配置内核
+          make defconfig
+          
+          # 2. 编译内核镜像 (使用所有 CPU 核心)
+          make -j$(nproc) Image
+          
+          echo "编译完成，检查产物..."
+          ls -l arch/arm64/boot/Image
 
-      - name: 5. 验证并编译
-        working-directory: ./kernel-workspace
-        run: |
-          # 针对该分支，直接使用官方文档推荐的 slider_dist 目标
-          ./tools/bazel run \
-            --local_resources=memory=HOST_RAM*.7,cpu=HOST_CPUS \
-            //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
-
-      - name: 6. 上传产物
+      - name: 5. 上传内核镜像
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-Mainline-Kernel
-          path: |
-            kernel-workspace/out/dist/boot.img
-            kernel-workspace/out/dist/dtbo.img
-            kernel-workspace/out/dist/vendor_boot.img
-            kernel-workspace/out/dist/vendor_kernel_boot.img
-            kernel-workspace/out/dist/initramfs.img
+          name: Kernel-6.12-Image
+          path: kernel-612/arch/arm64/boot/Image
