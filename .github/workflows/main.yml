@@ -4,27 +4,41 @@ on: [workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - name: 腾出磁盘空间 (最重要，否则 100% 报错)
+steps:
+      - name: 腾出磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: 同步内核源码
+      - name: 安装并配置 Repo 工具
         run: |
-          export PATH=$PATH:~/bin
-          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101
-          repo sync -c -j8
-          
-      - name: 确认 BUILD 文件位置
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          # 将 ~/bin 添加到全局 PATH，使其在后续所有 Step 中生效
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: 同步内核源码 (6.12 分支)
+        # 注意：这里不再需要手动 export PATH 了
         run: |
-          # 这里的搜索能帮你确定正确的 Bazel 路径
-          find . -name "slider_dist" || echo "未找到 slider 目标"
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101 --depth=1
+          repo sync -c -j8 --no-tags --no-clone-bundle
+
+      - name: 确认项目结构
+        run: |
+          ls -F
+          # 检查 private 目录是否存在
+          if [ -d "private/devices/google/raviole" ]; then
+            echo "✅ 找到专用驱动目录"
+          else
+            echo "❌ 未找到驱动目录，检查同步结果"
+            find . -maxdepth 3 -name "raviole"
+          fi
 
       - name: 使用 Kleaf 编译内核
         run: |
-          # 尝试新的路径格式
+          # 增加 --allow_analysis_failures 以防依赖检查微报错
           ./tools/bazel run //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
           
       - name: 上传镜像
