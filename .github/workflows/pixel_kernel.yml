@@ -1,4 +1,4 @@
-name: Build Kernel 6.12 (Direct Git)
+name: Build Pixel 6 Kernel 6.12 (Standalone)
 
 on:
   workflow_dispatch:
@@ -7,41 +7,37 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 释放磁盘空间
+      - name: 1. 释放空间并安装交叉编译器
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-
-      - name: 2. 安装环境
-        run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3
-          # 编译 6.12 需要最新的交叉编译器
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3 gcc-aarch64-linux-gnu
 
-      - name: 3. 直接克隆 6.12 源码
+      - name: 2. 克隆 Pixel 6 专属内核源码
         run: |
-          # 直接拉取你指定的那个 Tag，深度 1 节省空间
-          git clone --branch android-mainline-6.12 https://android.googlesource.com/kernel/common --depth=1 kernel-612
+          # 针对 Pixel 6 (gs101) 的 6.12 核心代码库
+          git clone --depth=1 https://android.googlesource.com/kernel/common -b android-mainline-6.12 kernel-source
 
-      - name: 4. 传统方式编译 (非 Bazel)
-        working-directory: ./kernel-612
+      - name: 3. 编译内核本体
+        working-directory: ./kernel-source
         run: |
-          # 由于没有 repo 就没有 Kleaf 环境，我们回归传统的内核编译方式
-          # 这种方式最稳，不依赖 Google 复杂的 Bazel 规则
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          
-          # 1. 配置内核
-          make defconfig
-          
-          # 2. 编译内核镜像 (使用所有 CPU 核心)
-          make -j$(nproc) Image
-          
-          echo "编译完成，检查产物..."
-          ls -l arch/arm64/boot/Image
+          # 使用 Pixel 6 的默认配置 (gki 基础配置)
+          make gki_defconfig
+          # 编译 Image 和 压缩后的镜像
+          make -j$(nproc) Image.lz4
 
-      - name: 5. 上传内核镜像
+      - name: 4. 下载打包工具 (Android Image Kitchen)
+        run: |
+          git clone https://github.com/osm0sis/Android-Image-Kitchen.git AIK
+          # 准备一个标准的 Pixel 6 boot.img 作为模板 (你可以替换为你的模板链接)
+          # 这里如果没有模板，我们先只上传内核本体
+
+      - name: 5. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-6.12-Image
-          path: kernel-612/arch/arm64/boot/Image
+          name: Pixel6-612-Kernel-Image
+          path: |
+            kernel-source/arch/arm64/boot/Image.lz4
+            kernel-source/.config
