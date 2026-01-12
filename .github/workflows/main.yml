@@ -11,24 +11,22 @@ jobs:
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: 安装 Repo 工具
-        run: |
-          mkdir ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          export PATH=$PATH:~/bin
-
-      - name: 同步内核源码 (6.12 分支)
+      - name: 同步内核源码
         run: |
           export PATH=$PATH:~/bin
-          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101 --depth=1
-          repo sync -c -j8 --no-tags --no-clone-bundle
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101
+          repo sync -c -j8
+          
+      - name: 确认 BUILD 文件位置
+        run: |
+          # 这里的搜索能帮你确定正确的 Bazel 路径
+          find . -name "slider_dist" || echo "未找到 slider 目标"
 
       - name: 使用 Kleaf 编译内核
         run: |
-          # 编译 Pixel 6 的目标产物 (代号 slider)
-          ./tools/bazel run //private/devices/google/raviole:slider_dist
-
+          # 尝试新的路径格式
+          ./tools/bazel run //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
+          
       - name: 上传镜像
         uses: actions/upload-artifact@v4
         with:
