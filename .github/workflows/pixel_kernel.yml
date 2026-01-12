@@ -39,8 +39,10 @@ jobs:
         working-directory: ./kernel-workspace
         run: |
           # 针对该分支，直接使用官方文档推荐的 slider_dist 目标
+          # 修正：将参数完全拆开，并使用 --ram_utilization_factor 这种更稳定的 Kleaf 方式
           ./tools/bazel run \
-            --local_resources=memory=HOST_RAM*.7,cpu=HOST_CPUS \
+            --local_resources=memory=HOST_RAM*.7 \
+            --local_resources=cpu=HOST_CPUS \
             //private/devices/google/raviole:slider_dist -- --dist_dir=out/dist
 
       - name: 6. 上传产物
