@@ -1,4 +1,4 @@
-name: Build Pixel 6 GKI Kernel
+name: Build Pixel 6 Mainline 6.12 GKI
 
 on:
   workflow_dispatch:
@@ -25,21 +25,31 @@ jobs:
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 4. 同步 5.10 GKI 分支 (最稳版本)
+      - name: 4. 同步主线源码并切换到 6.12 Tag
         run: |
           mkdir kernel-workspace && cd kernel-workspace
-          # 注意：这里改用 common-android12-5.10 分支，它是纯粹的内核源码
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --depth=1
+          # 使用 android-mainline 清单，这是获取 6.12 最正确的路径
+          repo init -u https://android.googlesource.com/kernel/manifest -b android-mainline --depth=1
           repo sync -c -j8
+          
+          # 进入 common 目录切换到你要求的 6.12 标签
+          cd common
+          git fetch --tags
+          git checkout android-mainline-6.12
+          cd ..
 
-      - name: 5. 编译 GKI 核心
+      - name: 5. 编译 GKI 6.12 核心
         working-directory: ./kernel-workspace
         run: |
-          # 编译通用 aarch64 内核目标，不依赖 private 驱动
-          ./tools/bazel run --jobs=2 //common:kernel_aarch64_dist -- --dist_dir=out/dist
+          # 自动寻找 bazel 路径，防止不同分支路径不一
+          BAZEL_BIN=$(find . -name "bazel" -type f -executable | head -n 1)
+          echo "使用 Bazel 路径: $BAZEL_BIN"
+          
+          # 运行编译：这次使用最稳的 aarch64 目标
+          $BAZEL_BIN run --jobs=2 //common:kernel_aarch64_dist -- --dist_dir=out/dist
 
-      - name: 6. 上传 boot.img
+      - name: 6. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-GKI-Kernel
+          name: Pixel6-GKI-6.12-Kernel
           path: kernel-workspace/out/dist/boot.img
