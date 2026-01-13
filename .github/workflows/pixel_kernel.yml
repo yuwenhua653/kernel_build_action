@@ -67,14 +67,17 @@ jobs:
       - name: 6. 归档产物
         if: success()
         run: |
+          # 确保进入了产物实际所在的目录
           cd kernel/out/dist/
-          # 确认关键镜像已生成
-          ls -lh boot.img vendor_boot.img dtb.img || echo "部分镜像缺失"
-          tar -czvf ../../../pixel6-kernel-slider.tar.gz .
+          # 打印一下文件列表，让我们在日志里能看到 boot.img 确实存在
+          ls -lh
+          # 打包当前文件夹所有内容，并把压缩包放在根目录 (../../../)
+          tar -czvf ${{ github.workspace }}/pixel6-slider-kernel.tar.gz .
 
-      - name: 7. 上传编译结果
+      - name: 7. 上传 Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Pixel6-Slider-Artifacts
-          path: pixel6-slider-kernel.tar.gz
-          retention-days: 5
+          # 直接指向根目录下的压缩包
+          path: ${{ github.workspace }}/pixel6-slider-kernel.tar.gz
