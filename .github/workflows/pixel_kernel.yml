@@ -48,7 +48,7 @@ jobs:
           ./tools/bazel run --lto=thin \
             --strategy=KernelModule=standalone \
             --strategy=GenRule=standalone \
-            //gs/google-modules/soc-modules:slider_dist -- --dist_dir=out/dist
+            /private/google-modules/soc/gs:slider_dist -- --dist_dir=out/dist
 
       - name: 5. 打包并上传产物
         if: success()
