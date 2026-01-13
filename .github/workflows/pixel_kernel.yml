@@ -53,6 +53,16 @@ jobs:
           ln -sfn private/google-modules gs
           echo "同步后的磁盘状态："
           df -h
+          
+          - name: 极限删除无关平台预建工具
+        run: |
+          cd kernel
+          # 删除所有不属于 linux-x86 的工具链（如 darwin/windows 平台）
+          find prebuilts -type d -name "darwin-x86" -exec rm -rf {} + || true
+          find prebuilts -type d -name "windows-x86" -exec rm -rf {} + || true
+          # 删除不需要的测试或文档目录
+          rm -rf prebuilts/clang-tools/*-darwin
+          df -h
 
       - name: 5. 执行最终修正的编译命令
         run: |
