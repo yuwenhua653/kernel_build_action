@@ -57,12 +57,12 @@ jobs:
       - name: 5. 执行最终修正的编译命令
         run: |
           cd kernel
-          # 限制并发为 2，防止内存溢出和磁盘瞬时压力过大导致 IO 报错
+          # 注意：slider_dist 使用 --destdir 参数而不是 --dist_dir
           ./tools/bazel run --config=fast \
             --jobs=2 \
             --strategy=KernelModule=standalone \
             --strategy=GenRule=standalone \
-            //private/google-modules/soc/gs:slider_dist -- --dist_dir=out/dist
+            //private/google-modules/soc/gs:slider_dist -- --destdir out/dist
 
       - name: 6. 归档产物
         if: success()
