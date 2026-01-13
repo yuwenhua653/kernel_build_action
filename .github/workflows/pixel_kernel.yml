@@ -54,7 +54,7 @@ jobs:
           echo "同步后的磁盘状态："
           df -h
           
-       - name:5. 极限删除无关平台预建工具
+      - name: 5. 极限删除无关平台预建工具
         run: |
           cd kernel
           # 删除所有不属于 linux-x86 的工具链（如 darwin/windows 平台）
