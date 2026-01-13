@@ -1,19 +1,17 @@
-name: Pixel 6 Kernel Build (Slider Fast)
+name: Pixel 6 Kernel Build (Ultimate Space Fix)
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 设置较长的超时时间，内核编译通常需要 2-3 小时
-    timeout-minutes: 360 
+    timeout-minutes: 360
 
     steps:
       - name: 1. 深度扩容磁盘空间
         uses: jlumbroso/free-disk-space@main
         with:
-          # 核心：删除不需要的预装环境，腾出约 100GB+ 空间
           tool-cache: true
           android: true
           dotnet: true
@@ -22,62 +20,61 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: 2. 检查可用空间
-        run: |
-          echo "清理后的磁盘状态："
-          df -h
-
-      - name: 3. 安装依赖工具
+      - name: 2. 安装依赖工具
         run: |
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3 curl
-          # 安装 Google Repo 工具
           mkdir -p ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 4. Repo 初始化与同步 (深度优化)
+      - name: 3. Repo 初始化与同步 (深度优化)
         run: |
           git config --global user.email "bot@example.com"
           git config --global user.name "KernelBot"
           mkdir kernel && cd kernel
-          
-          # 必须使用 --depth=1 减少 Git 历史记录占用的空间
+          # 使用 --depth=1 极度压缩 Git 历史
           repo init -u https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
-          
-          # 仅同步当前分支，避免拉取不相关的设备驱动
           repo sync -j$(nproc) -c --no-tags --no-clone-bundle
-          
-          # 修复可能缺失的软链接
-          ln -sfn private/google-modules gs
-          echo "同步后的磁盘状态："
-          df -h
 
-      - name: 5. 执行最终修正的编译命令
+      - name: 4. 极限手术：删除无关平台工具 (腾出约 15GB)
         run: |
           cd kernel
-          # 注意：slider_dist 使用 --destdir 参数而不是 --dist_dir
+          # 删除所有不属于 linux-x86 的预编译工具（如 MacOS/Windows 平台）
+          find prebuilts -type d \( -name "darwin-x86" -o -name "windows-x86" -o -name "darwin-arm64" \) -exec rm -rf {} + || true
+          # 删除不需要的 clang 说明文档和测试
+          find prebuilts -type d -name "test" -path "*clang*" -exec rm -rf {} + || true
+          df -h
+
+      - name: 5. 执行编译 (禁用巨型归档)
+        run: |
+          cd kernel
+          # 建立必要的软链接
+          ln -sfn private/google-modules gs
+          
+          # 核心修复：
+          # --no-archive: 禁止生成数 GB 的 unstripped_modules.tar.gz（你报错的根源）
+          # --jobs=2: 稳定压制，防止瞬时磁盘写爆
           ./tools/bazel run --config=fast \
             --jobs=2 \
             --strategy=KernelModule=standalone \
             --strategy=GenRule=standalone \
-            //private/google-modules/soc/gs:slider_dist -- --destdir out/dist
+            //private/google-modules/soc/gs:slider_dist -- \
+            --destdir out/dist \
+            --no-archive
 
       - name: 6. 归档产物
         if: success()
         run: |
-          # 确保进入了产物实际所在的目录
           cd kernel/out/dist/
-          # 打印一下文件列表，让我们在日志里能看到 boot.img 确实存在
           ls -lh
-          # 打包当前文件夹所有内容，并把压缩包放在根目录 (../../../)
-          tar -czvf ${{ github.workspace }}/pixel6-slider-kernel.tar.gz .
+          # 只打包核心镜像，进一步节省上传时间
+          tar -czvf ${{ github.workspace }}/pixel6-slider-kernel.tar.gz boot.img *dtb* *.img || tar -czvf ${{ github.workspace }}/pixel6-slider-kernel.tar.gz .
 
       - name: 7. 上传 Artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-Slider-Artifacts
-          # 直接指向根目录下的压缩包
-          path: ${{ github.workspace }}/pixel6-slider-kernel.tar.gz
+          name: Pixel6-Slider-Final
+          path: pixel6-slider-kernel.tar.gz
+          retention-days: 3
