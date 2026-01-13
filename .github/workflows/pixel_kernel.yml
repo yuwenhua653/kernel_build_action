@@ -1,4 +1,4 @@
-name: Build Pixel 6 Kernel (Kleaf)
+name: Build Pixel 6 Kernel (Slider Dist)
 
 on:
   workflow_dispatch: # 手动触发
@@ -6,24 +6,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 增加权限，确保可以上传产物
-    permissions:
-      contents: write
-
     steps:
-      - name: 1. 最大化磁盘空间
+      - name: 1. 极限释放磁盘空间
         run: |
-          echo "开始清理无用软件..."
+          echo "正在清理虚拟机冗余文件..."
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           docker image prune -a -f
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # 检查剩余空间
           df -h
 
-      - name: 2. 安装依赖工具
+      - name: 2. 环境准备
         run: |
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3 curl
-          # 安装 repo 工具
           mkdir -p ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
@@ -34,31 +32,32 @@ jobs:
           git config --global user.email "bot@example.com"
           git config --global user.name "KernelBot"
           mkdir kernel && cd kernel
-          # 初始化 Pixel 6 专属分支
+          # 使用你指定的 Pixel 6 官方清单分支
           repo init -u https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
-          # 只同步当前分支，不克隆 bundle，减少数据量
+          # 仅同步必要代码，减少磁盘占用
           repo sync -j$(nproc) -c --no-tags --no-clone-bundle
+          # 建立 gs 软链接（防止部分磁盘格式下链接丢失）
+          ln -sfn private/google-modules gs
           df -h
 
-      - name: 4. 执行 Bazel (Kleaf) 编译
+      - name: 4. 执行修正后的编译命令
         run: |
           cd kernel
-          # 这一步非常耗时且占用空间
-          # --lto=thin 减少内存和空间压力
-          # --dist_dir=out/dist 指定产物输出目录
-          ./tools/bazel run --config=fast //private/google-modules/soc/gs:slider_dist -- --dist_dir=out/dist
+          # 使用你提供的 XDA 修正路径
+          # 加入 --strategy 减少沙箱路径深度，预防之前遇到的 headersinst 错误
+          ./tools/bazel run --lto=thin \
+            --strategy=KernelModule=standalone \
+            --strategy=GenRule=standalone \
+            //gs/google-modules/soc-modules:slider_dist -- --dist_dir=out/dist
 
-      - name: 5. 检查并重命名产物
-        if: always()
+      - name: 5. 打包并上传产物
+        if: success()
         run: |
           cd kernel/out/dist/
-          ls -lh
-          # 将产物打包，方便下载
-          tar -czvf ../../../pixel6-kernel-artifacts.tar.gz .
-
-      - name: 6. 上传编译产物
+          tar -czvf ../../../pixel6-slider-kernel.tar.gz .
+          
+      - name: 6. 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-Kernel-ZP11-Compatible
-          path: pixel6-kernel-artifacts.tar.gz
-          retention-days: 7
+          name: Pixel6-Slider-Kernel
+          path: pixel6-slider-kernel.tar.gz
