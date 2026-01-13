@@ -1,59 +1,80 @@
-name: Build Pixel 6 Kernel (Slider Dist Fast)
+name: Pixel 6 Kernel Build (Slider Fast)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 手动触发
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 设置较长的超时时间，内核编译通常需要 2-3 小时
+    timeout-minutes: 360 
+
     steps:
-      - name: 1. 清理磁盘空间 (防止 No Space Left 错误)
+      - name: 1. 深度扩容磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # 核心：删除不需要的预装环境，腾出约 100GB+ 空间
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: 2. 检查可用空间
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          docker image prune -a -f
+          echo "清理后的磁盘状态："
           df -h
 
-      - name: 2. 环境准备
+      - name: 3. 安装依赖工具
         run: |
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev git-lfs python3 curl
+          # 安装 Google Repo 工具
           mkdir -p ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: 3. Repo 初始化与同步
+      - name: 4. Repo 初始化与同步 (深度优化)
         run: |
           git config --global user.email "bot@example.com"
           git config --global user.name "KernelBot"
           mkdir kernel && cd kernel
-          # 初始化 Pixel 6 分支
+          
+          # 必须使用 --depth=1 减少 Git 历史记录占用的空间
           repo init -u https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
-          # 同步源码
+          
+          # 仅同步当前分支，避免拉取不相关的设备驱动
           repo sync -j$(nproc) -c --no-tags --no-clone-bundle
+          
+          # 修复可能缺失的软链接
+          ln -sfn private/google-modules gs
+          echo "同步后的磁盘状态："
           df -h
 
-      - name: 4. 执行最终修正的编译命令
+      - name: 5. 执行最终修正的编译命令
         run: |
           cd kernel
-          # 使用 --config=fast 和你提供的精确物理路径
-          # --strategy 依然保留，用于规避 GitHub 路径深度导致的头文件安装错误
+          # 限制并发为 2，防止内存溢出和磁盘瞬时压力过大导致 IO 报错
           ./tools/bazel run --config=fast \
+            --jobs=2 \
             --strategy=KernelModule=standalone \
             --strategy=GenRule=standalone \
             //private/google-modules/soc/gs:slider_dist -- --dist_dir=out/dist
 
-      - name: 5. 归档产物
+      - name: 6. 归档产物
         if: success()
         run: |
           cd kernel/out/dist/
-          # 检查生成的 boot.img 和 vendor_boot.img
-          ls -lh
-          tar -czvf ../../../pixel6-kernel-fast.tar.gz .
-          
-      - name: 6. 上传 Artifact
+          # 确认关键镜像已生成
+          ls -lh boot.img vendor_boot.img dtb.img || echo "部分镜像缺失"
+          tar -czvf ../../../pixel6-kernel-slider.tar.gz .
+
+      - name: 7. 上传编译结果
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel6-Fast-Kernel
-          path: pixel6-kernel-fast.tar.gz
+          name: Pixel6-Slider-Artifacts
+          path: pixel6-slider-kernel.tar.gz
+          retention-days: 5
