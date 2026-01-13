@@ -54,7 +54,7 @@ jobs:
           echo "同步后的磁盘状态："
           df -h
           
-          - name: 极限删除无关平台预建工具
+       - name:5. 极限删除无关平台预建工具
         run: |
           cd kernel
           # 删除所有不属于 linux-x86 的工具链（如 darwin/windows 平台）
@@ -64,7 +64,7 @@ jobs:
           rm -rf prebuilts/clang-tools/*-darwin
           df -h
 
-      - name: 5. 执行最终修正的编译命令
+      - name: 6. 执行最终修正的编译命令
         run: |
           cd kernel
           # 注意：slider_dist 使用 --destdir 参数而不是 --dist_dir
@@ -74,7 +74,7 @@ jobs:
             --strategy=GenRule=standalone \
             //private/google-modules/soc/gs:slider_dist -- --destdir out/dist
 
-      - name: 6. 归档产物 (路径修正版)
+      - name: 7. 归档产物 (路径修正版)
         if: always() # 即使之前有警告也执行，确保我们能看到文件在哪
         run: |
           # 进入包含镜像的实际目录
@@ -83,7 +83,7 @@ jobs:
           # 打包当前目录下所有文件，存放到上级目录的物理路径
           tar -czvf ../../../pixel6-slider-kernel.tar.gz .
           
-      - name: 7. 上传 Artifact
+      - name: 8. 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Pixel6-Slider-Artifacts
