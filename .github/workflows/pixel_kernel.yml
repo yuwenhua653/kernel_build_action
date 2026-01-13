@@ -46,7 +46,7 @@ jobs:
           # 这一步非常耗时且占用空间
           # --lto=thin 减少内存和空间压力
           # --dist_dir=out/dist 指定产物输出目录
-          ./tools/bazel run --lto=thin //private/devices/google/raviole:raviole_dist -- --dist_dir=out/dist
+          ./tools/bazel run --config=fast //private/google-modules/soc/gs:slider_dist -- --dist_dir=out/dist
 
       - name: 5. 检查并重命名产物
         if: always()
