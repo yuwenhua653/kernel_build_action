@@ -44,7 +44,7 @@ jobs:
           mkdir kernel && cd kernel
           
           # 必须使用 --depth=1 减少 Git 历史记录占用的空间
-          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android-gs-raviole-mainline --depth=1
+          repo init -u https://android.googlesource.com/kernel/manifest -b gs-android16-6.12-gs101 --depth=1
           
           # 仅同步当前分支，避免拉取不相关的设备驱动
           repo sync -j$(nproc) -c --no-tags --no-clone-bundle
