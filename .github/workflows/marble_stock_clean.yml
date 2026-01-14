@@ -1,4 +1,4 @@
-name: Build Marble Pure Stock Kernel
+name: Build Marble Pure Kernel (Melt-Rebase Branch)
 
 on:
   workflow_dispatch:
@@ -14,68 +14,64 @@ jobs:
 
       - name: 2. 获取内核源码与工具链
         run: |
-          # 克隆 Pzqqt 的 marble 内核源码 (14 分支代表适配新版安卓)
-          git clone --depth=1 https://github.com/Pzqqt/android_kernel_xiaomi_marble -b 14 kernel
+          # 指定克隆 melt-rebase 分支
+          git clone --depth=1 https://github.com/Pzqqt/android_kernel_xiaomi_marble -b melt-rebase kernel
           
-          # 克隆最新的 AOSP Clang (r487703)
+          # 克隆 AOSP Clang 工具链 (r487703)
           mkdir clang
           curl -LSs https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487703.tar.gz -o clang.tar.gz
           tar -C clang/ -xf clang.tar.gz
 
-      - name: 3. 执行纯净编译 (无任何第三方补丁)
+      - name: 3. 执行纯净编译
         run: |
           cd kernel
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
           
-          # 设定输出目录
           OUT_DIR=out
-          
-          # 生成默认配置
-          make -j$(nproc) O=$OUT_DIR \
-            ARCH=arm64 \
-            CC=clang \
+          # 自动寻找 defconfig 的确切位置（适配 vendor/ 或 arch/ 目录）
+          CONF_FILE=$(find arch/arm64/configs/ -name "marble_defconfig" | sed 's|arch/arm64/configs/||')
+          echo "检测到配置文件路径: $CONF_FILE"
+
+          # 配置内核
+          make -j$(nproc) O=$OUT_DIR ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            vendor/marble_defconfig
+            $CONF_FILE
           
           # 开始全面编译
-          make -j$(nproc) O=$OUT_DIR \
-            ARCH=arm64 \
-            CC=clang \
+          make -j$(nproc) O=$OUT_DIR ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip
+            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-      - name: 4. 打包 AnyKernel3 (marble 专用)
+      - name: 4. 打包 AnyKernel3 (marble A/B 分区适配)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-          # 清理 AnyKernel 默认示例文件
-          rm -rf AnyKernel3/.git
-          
-          # 自动配置 anykernel.sh 以适配 marble
+          # 基础配置
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
           sed -i 's/block=\/dev\/block\/platform\/omap\/omap_hsmmc.1\/by-name\/boot/block=auto/g' AnyKernel3/anykernel.sh
           
-          # 拷贝编译出的内核镜像 (Image.gz)
-          # 注：部分 marble 源码可能产出 Image.gz-dtb，脚本会自动适配
+          # 识别并提取镜像（melt-rebase 可能带有 dtb 或 dtbo）
           if [ -f kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
             cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz
-          else
+          elif [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
             cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f kernel/out/arch/arm64/boot/Image ]; then
+            gzip -c kernel/out/arch/arm64/boot/Image > AnyKernel3/Image.gz
+          fi
+          
+          # 额外检查是否有 dtbo 镜像（部分 marble 内核需要）
+          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
           fi
           
           cd AnyKernel3
-          zip -r ../marble-pure-kernel.zip ./*
+          zip -r ../marble-melt-kernel.zip ./*
 
       - name: 5. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Marble-Pure-Stock-Kernel
-          path: marble-pure-kernel.zip
+          name: Marble-Melt-Rebase-Kernel
+          path: marble-melt-kernel.zip
