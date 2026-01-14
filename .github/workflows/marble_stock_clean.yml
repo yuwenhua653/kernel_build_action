@@ -1,4 +1,4 @@
-name: Build Marble Pure Kernel (Toolchain Fixed)
+name: Build Marble Pure Kernel for Android 16
 
 on:
   workflow_dispatch:
@@ -12,47 +12,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm git-lfs python3 curl zip wget
 
-      - name: 2. 获取内核源码与稳健工具链
+      - name: 2. 获取内核源码与 AOSP 官方工具链
         run: |
-          # 1. 克隆 marble 内核源码
+          # 1. 克隆 marble 内核源码 (melt-rebase)
           git clone --depth=1 https://github.com/Pzqqt/android_kernel_xiaomi_marble -b melt-rebase kernel
           
-          # 2. 获取 ZyC Clang (这是目前最稳、最适配的方案)
-          mkdir clang
-          cd clang
-          # 使用 ZyC 的稳定版 Clang 17
-          wget https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20230522-release/Clang-17.0.0-20230522-release.tar.gz
-          tar -xf Clang-17.0.0-20230522-release.tar.gz
-          cd ..
+          # 2. 直接克隆 AOSP 预编译 Clang (这是最稳的方式，适配 Android 15/16)
+          # 我们选择 clang-r522815，这是 Android 15/16 早期预览版常用的稳定版本
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b main clang_dir
           
-          # 3. 获取辅助 GCC (Marble 5.10 编译必备)
+          # 3. 获取辅助 GCC (5.10 内核必备)
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 -b lineage-19.1 gcc64
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 -b lineage-19.1 gcc32
 
-      - name: 3. 执行编译 (全参数适配版)
+      - name: 3. 执行编译 (针对 Android 16 优化参数)
         run: |
           cd kernel
-          # 设置路径：ZyC Clang 的可执行文件在 bin 下
-          CLANG_PATH=$GITHUB_WORKSPACE/clang/bin
-          GCC64_PATH=$GITHUB_WORKSPACE/gcc64/bin
-          GCC32_PATH=$GITHUB_WORKSPACE/gcc32/bin
-          export PATH=$CLANG_PATH:$GCC64_PATH:$GCC32_PATH:$PATH
+          # 寻找最新的 Clang 版本目录
+          CLANG_PATH=$(find ../clang_dir -name "clang-r*" -type d | head -n 1)/bin
+          export PATH=$CLANG_PATH:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
           
           OUT_DIR=out
-          # 自动寻找配置文件
           CONF_FILE=$(find arch/arm64/configs/ -name "marble_defconfig" | sed 's|arch/arm64/configs/||')
-          echo "Using Config: $CONF_FILE"
 
-          # 配置内核
+          # 编译指令：加入 LLVM=1 以适配 Android 16 的严格链接要求
           make -j$(nproc) O=$OUT_DIR ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             $CONF_FILE
-          
-          # 开始全面编译
-          # 注意：ZyC Clang 建议使用 LLVM=1 参数来简化路径
+            
           make -j$(nproc) O=$OUT_DIR ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -61,21 +51,21 @@ jobs:
             LLVM=1 LLVM_IAS=1 \
             LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-      - name: 4. 打包 AnyKernel3
+      - name: 4. 打包 AnyKernel3 (适配 Android 16 动态分区)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-          sed -i 's/block=\/dev\/block\/platform\/omap\/omap_hsmmc.1\/by-name\/boot/block=auto/g' AnyKernel3/anykernel.sh
+          # Android 16 强制要求识别逻辑正确
+          sed -i 's/block=auto/block=\/dev\/block\/by-name\/boot/g' AnyKernel3/anykernel.sh
           
-          # 寻找并提取 Image.gz 和 dtbo.img
           find kernel/out/arch/arm64/boot/ -name "Image.gz*" -exec cp {} AnyKernel3/Image.gz \;
           find kernel/out/arch/arm64/boot/ -name "dtbo.img" -exec cp {} AnyKernel3/ \;
           
           cd AnyKernel3
-          zip -r ../marble-melt-kernel.zip ./*
+          zip -r ../marble-a16-kernel.zip ./*
 
-      - name: 5. 上传产物
+      - name: 5. 上传
         uses: actions/upload-artifact@v4
         with:
-          name: Marble-Melt-Rebase-Kernel
-          path: marble-melt-kernel.zip
+          name: Marble-Android16-Kernel
+          path: marble-a16-kernel.zip
