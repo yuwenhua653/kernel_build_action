@@ -1,4 +1,4 @@
-name: Build Marble Pure Kernel (Melt-Rebase Branch)
+name: Build Marble Pure Kernel (Melt-Rebase Branch Fixed)
 
 on:
   workflow_dispatch:
@@ -10,62 +10,59 @@ jobs:
       - name: 1. 环境准备
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm git-lfs python3 curl zip
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm git-lfs python3 curl zip wget
 
       - name: 2. 获取内核源码与工具链
         run: |
-          # 指定克隆 melt-rebase 分支
           git clone --depth=1 https://github.com/Pzqqt/android_kernel_xiaomi_marble -b melt-rebase kernel
           
-          # 克隆 AOSP Clang 工具链 (r487703)
-          mkdir clang
-          curl -LSs https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487703.tar.gz -o clang.tar.gz
-          tar -C clang/ -xf clang.tar.gz
+          # 获取 Clang
+          mkdir clang && cd clang
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487703.tar.gz
+          tar -xf clang-r487703.tar.gz
+          cd ..
+          
+          # 获取辅助 GCC (Marble 5.10 编译必备)
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 -b lineage-19.1 gcc64
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 -b lineage-19.1 gcc32
 
-      - name: 3. 执行纯净编译
+      - name: 3. 执行编译 (全参数优化版)
         run: |
           cd kernel
-          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          # 设置路径
+          CLANG_PATH=$GITHUB_WORKSPACE/clang/bin
+          GCC64_PATH=$GITHUB_WORKSPACE/gcc64/bin
+          GCC32_PATH=$GITHUB_WORKSPACE/gcc32/bin
+          export PATH=$CLANG_PATH:$GCC64_PATH:$GCC32_PATH:$PATH
           
           OUT_DIR=out
-          # 自动寻找 defconfig 的确切位置（适配 vendor/ 或 arch/ 目录）
           CONF_FILE=$(find arch/arm64/configs/ -name "marble_defconfig" | sed 's|arch/arm64/configs/||')
-          echo "检测到配置文件路径: $CONF_FILE"
 
-          # 配置内核
-          make -j$(nproc) O=$OUT_DIR ARCH=arm64 CC=clang \
+          # 编译命令
+          make -j$(nproc) O=$OUT_DIR ARCH=arm64 \
+            CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             $CONF_FILE
           
-          # 开始全面编译
-          make -j$(nproc) O=$OUT_DIR ARCH=arm64 CC=clang \
+          make -j$(nproc) O=$OUT_DIR ARCH=arm64 \
+            CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-      - name: 4. 打包 AnyKernel3 (marble A/B 分区适配)
+      - name: 4. 打包 AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-          # 基础配置
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
           sed -i 's/block=\/dev\/block\/platform\/omap\/omap_hsmmc.1\/by-name\/boot/block=auto/g' AnyKernel3/anykernel.sh
           
-          # 识别并提取镜像（melt-rebase 可能带有 dtb 或 dtbo）
-          if [ -f kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz
-          elif [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
-            cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
-          elif [ -f kernel/out/arch/arm64/boot/Image ]; then
-            gzip -c kernel/out/arch/arm64/boot/Image > AnyKernel3/Image.gz
-          fi
-          
-          # 额外检查是否有 dtbo 镜像（部分 marble 内核需要）
-          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
-            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
-          fi
+          # 提取 Image.gz
+          find kernel/out/arch/arm64/boot/ -name "Image.gz*" -exec cp {} AnyKernel3/Image.gz \;
+          # 提取 dtbo.img
+          find kernel/out/arch/arm64/boot/ -name "dtbo.img" -exec cp {} AnyKernel3/ \;
           
           cd AnyKernel3
           zip -r ../marble-melt-kernel.zip ./*
