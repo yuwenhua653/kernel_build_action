@@ -13,13 +13,23 @@ jobs:
           tool-cache: true
           android: true
 
-      - name: 2. 拼装 A16/6.6 内核架构
+      - name: 2. 按照 tbalden 结构拼装源码 (A16 / 6.6)
         run: |
           mkdir kernel_workspace && cd kernel_workspace
-          # 拉取 tbalden 已经适配 6.6 的核心树
+          
+          # 1. 克隆核心内核树 (common)
           git clone -b aosp_cleanslate_a16_6_6_unified --depth=1 https://github.com/tbalden/google_common_aosp_simple common
+          
+          # 2. 克隆驱动树 (drivers)
           git clone -b cleanslate_unified_a16_6_6 --depth=1 https://github.com/tbalden/google_common_kernel_drivers_simple drivers
+          
+          # 3. 创建 private 目录并建立链接 (关键修复)
+          mkdir -p private
+          # 将 drivers 目录链接为 private/google-modules
           ln -s ../drivers private/google-modules
+          
+          # 4. 克隆构建辅助脚本
+          git clone --depth=1 https://github.com/tbalden/google_common_kernel_builder_cs build_scripts
 
       - name: 3. 集成 SUSFS & Sukisu Ultra
         run: |
