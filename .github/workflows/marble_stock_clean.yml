@@ -1,0 +1,81 @@
+name: Build Marble Pure Stock Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 环境准备
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm git-lfs python3 curl zip
+
+      - name: 2. 获取内核源码与工具链
+        run: |
+          # 克隆 Pzqqt 的 marble 内核源码 (14 分支代表适配新版安卓)
+          git clone --depth=1 https://github.com/Pzqqt/android_kernel_xiaomi_marble -b 14 kernel
+          
+          # 克隆最新的 AOSP Clang (r487703)
+          mkdir clang
+          curl -LSs https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487703.tar.gz -o clang.tar.gz
+          tar -C clang/ -xf clang.tar.gz
+
+      - name: 3. 执行纯净编译 (无任何第三方补丁)
+        run: |
+          cd kernel
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          
+          # 设定输出目录
+          OUT_DIR=out
+          
+          # 生成默认配置
+          make -j$(nproc) O=$OUT_DIR \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            vendor/marble_defconfig
+          
+          # 开始全面编译
+          make -j$(nproc) O=$OUT_DIR \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip
+
+      - name: 4. 打包 AnyKernel3 (marble 专用)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+          # 清理 AnyKernel 默认示例文件
+          rm -rf AnyKernel3/.git
+          
+          # 自动配置 anykernel.sh 以适配 marble
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          sed -i 's/block=\/dev\/block\/platform\/omap\/omap_hsmmc.1\/by-name\/boot/block=auto/g' AnyKernel3/anykernel.sh
+          
+          # 拷贝编译出的内核镜像 (Image.gz)
+          # 注：部分 marble 源码可能产出 Image.gz-dtb，脚本会自动适配
+          if [ -f kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz
+          else
+            cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
+          fi
+          
+          cd AnyKernel3
+          zip -r ../marble-pure-kernel.zip ./*
+
+      - name: 5. 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Marble-Pure-Stock-Kernel
+          path: marble-pure-kernel.zip
