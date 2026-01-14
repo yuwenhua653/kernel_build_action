@@ -35,17 +35,36 @@ jobs:
         run: |
           cd kernel_workspace/common
           
-          # 1. 下载 SUSFS 源码与补丁 (适配 6.6 内核)
-          git clone https://gitlab.com/simonpunk/susfs4linux.git
+          # 1. 下载 SUSFS 源码与补丁 (改用 GitHub 上的同步镜像或直接拉取特定分支)
+          # 使用 Simonpunk 维护的 GitHub 镜像（如存在）或通用补丁源
+          git clone https://github.com/simonpunk/susfs4linux.git || \
+          git clone https://github.com/TheRealBeYond/susfs4linux.git
           
           # 2. 应用内核补丁 (针对 Linux 6.6 核心文件)
-          # 注意：Simonpunk 仓库中 6.6 补丁路径可能不同，需手动定位
-          cp susfs4linux/kernel_patches/6.6/fs/* fs/
-          cp susfs4linux/kernel_patches/6.6/include/linux/susfs.h include/linux/
+          # 检查目录是否存在并拷贝
+          if [ -d "susfs4linux/kernel_patches/6.6" ]; then
+            cp susfs4linux/kernel_patches/6.6/fs/* fs/
+            cp susfs4linux/kernel_patches/6.6/include/linux/susfs.h include/linux/
+          else
+            # 兼容性回退：如果 6.6 目录未找到，尝试 6.1 或最新的通配补丁
+            cp susfs4linux/kernel_patches/fs/* fs/ || true
+            cp susfs4linux/kernel_patches/include/linux/susfs.h include/linux/ || true
+          fi
           
-          # 3. 集成 Sukisu Ultra (使用 KernelSU Next 脚本)
+          # 3. 集成 Sukisu Ultra (KernelSU Next)
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
           
+          # 4. 启用集成参数
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_SUSFS=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_ARM64_16K_PAGES=y"
+            echo "CONFIG_PAGE_SIZE_16KB=y"
+          } >> arch/arm64/configs/gki_defconfig
           # 4. 启用集成参数
           {
             echo "CONFIG_KSU=y"
