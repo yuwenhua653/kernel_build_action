@@ -1,0 +1,71 @@
+name: Build Pixel 10 Pro XL Ultra-SUSFS (Linux 6.6)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 磁盘深度扩容
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+
+      - name: 2. 拼装 A16/6.6 内核架构
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          # 拉取 tbalden 已经适配 6.6 的核心树
+          git clone -b aosp_cleanslate_a16_6_6_unified --depth=1 https://github.com/tbalden/google_common_aosp_simple common
+          git clone -b cleanslate_unified_a16_6_6 --depth=1 https://github.com/tbalden/google_common_kernel_drivers_simple drivers
+          ln -s ../drivers private/google-modules
+
+      - name: 3. 集成 SUSFS & Sukisu Ultra
+        run: |
+          cd kernel_workspace/common
+          
+          # 1. 下载 SUSFS 源码与补丁 (适配 6.6 内核)
+          git clone https://gitlab.com/simonpunk/susfs4linux.git
+          
+          # 2. 应用内核补丁 (针对 Linux 6.6 核心文件)
+          # 注意：Simonpunk 仓库中 6.6 补丁路径可能不同，需手动定位
+          cp susfs4linux/kernel_patches/6.6/fs/* fs/
+          cp susfs4linux/kernel_patches/6.6/include/linux/susfs.h include/linux/
+          
+          # 3. 集成 Sukisu Ultra (使用 KernelSU Next 脚本)
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          
+          # 4. 启用集成参数
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_SUSFS=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_KPROBES=y"
+            # 针对 Pixel 10 Pro XL 的 16KB 页大小支持
+            echo "CONFIG_ARM64_16K_PAGES=y"
+            echo "CONFIG_PAGE_SIZE_16KB=y"
+          } >> arch/arm64/configs/gki_defconfig
+
+      - name: 4. 编译内核 (Kleaf 模式)
+        run: |
+          cd kernel_workspace
+          ./common/tools/bazel build --config=fast \
+            --jobs=2 \
+            //private/devices/google/franklin:franklin_dist
+
+      - name: 5. 提取并二次确认产物
+        run: |
+          mkdir output
+          find kernel_workspace/bazel-bin/ -name "boot.img" -exec cp {} output/ \;
+          # 包含 DTB 以确保屏幕驱动正常
+          find kernel_workspace/bazel-bin/ -name "dtb.img" -exec cp {} output/ \;
+          tar -czvf Pixel10PXL-Full-Mod.tar.gz -C output .
+
+      - name: 6. 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel10PXL-Advanced-Kernel
+          path: Pixel10PXL-Full-Mod.tar.gz
