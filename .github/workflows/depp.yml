@@ -1,181 +1,195 @@
-name: Build Melt Kernel
+name: Build Melt Kernel (marble)
 
 on:
+  # ① Actions 页面手动触发
   workflow_dispatch:
     inputs:
-      kernel_version:
-        description: '自定义内核版本号（留空则自动生成）'
-        required: false
-        default: ''
+      build_ksu:
+        description: "额外构建 KernelSU 版本 Image"
+        type: boolean
+        default: true
+      build_susfs:
+        description: "额外构建 KernelSU + SUSFS 版本 Image"
+        type: boolean
+        default: true
+      package_ak3:
+        description: "打包成 AnyKernel3 卡刷包"
+        type: boolean
+        default: true
+  # ② 也可以推送到 bouquet_ci 分支时自动编译
+  push:
+    branches: [ bouquet_ci ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_BRANCH: bouquet_ci          # build_bouquet.sh 所在分支
+  LLVM_VERSION: 23.1.1               # 与脚本内 CLANG_PATH 保持一致，不要随意改
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE: ccache
+  AK3_REPO: https://github.com/Pzqqt/AnyKernel3.git
+  AK3_BRANCH: Marble-Bouquet
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    name: Build kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 360             # 三次构建（含一次全量）留足时间
 
     steps:
-      - name: 检出内核源码
+      # ---------- 0. 清磁盘：内核 + LTO + ccache 很吃空间 ----------
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      # ---------- 1. 拉源码（bouquet_ci 分支，放到 kernel/ 子目录）----------
+      - name: 拉取内核源码
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
           fetch-depth: 1
 
-      - name: 安装系统依赖
+      - name: 设置构建信息
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex \
-            g++-multilib gcc-multilib git gnupg gperf \
-            lib32ncurses5-dev lib32readline-dev lib32z1-dev \
-            libelf-dev liblz4-tool libncurses5 libncurses5-dev \
-            libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
-            lzop pngcrush rsync schedtool squashfs-tools \
-            xsltproc zip zlib1g-dev python3 python-is-python3
+          echo "SHORT_SHA=${GITHUB_SHA:0:12}" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_ENV
 
-      - name: 配置 ccache 缓存
+      # ---------- 2. 缓存工具链 ----------
+      - name: 恢复 Slim LLVM 缓存
+        id: llvm-cache
         uses: actions/cache@v4
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          path: ~/build_toolchain/llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64
+
+      - name: 下载 Slim LLVM（缓存未命中时）
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          mkdir -p ~/build_toolchain && cd ~/build_toolchain
+          aria2c -x8 -s8 -k1M \
+            https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz
+
+      # ---------- 3. 安装依赖 + 解压工具链 ----------
+      - name: 安装编译依赖
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 bc bison flex libssl-dev libelf-dev kmod cpio zstd lz4 \
+            xz-utils zip unzip device-tree-compiler ccache wget \
+            python3 python-is-python3 python3-rich
+
+          mkdir -p ~/.local/bin
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # 7za：打包用；hdiffz/hpatchz：生成 ksu/susfs 差分补丁用
+          mkdir -p /tmp/7z && cd /tmp/7z
+          wget -nv https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz
+          tar -xJf 7z2603-linux-x64.tar.xz
+          (cp -f 7zzs ~/.local/bin/7za 2>/dev/null || cp -f 7zz ~/.local/bin/7za)
+
+          mkdir -p /tmp/hdiff && cd /tmp/hdiff
+          wget -nv https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip
+          7za x -y hdiffpatch_v4.12.2_bin_linux64.zip
+          cp -f linux64/hdiffz linux64/hpatchz ~/.local/bin/
+
+          chmod +x ~/.local/bin/*
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          cd ~/build_toolchain
+          tar -xJf llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz
+
+          ccache --max-size=2G
+          ccache --zero-stats
+          df -h /
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-marble-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ github.ref_name }}-
-            ccache-
+            ccache-marble-${{ runner.os }}-
 
-      - name: 克隆工具链
+      # ---------- 4. 构建 ----------
+      - name: 编译内核（原版 Image + 内核模块 + dtb/dtbo）
         run: |
-          mkdir -p ${{ github.workspace }}/toolchain
-          cd ${{ github.workspace }}/toolchain
-          
-          # 克隆预编译 clang（Neutron Clang，适用于 5.10 内核）
-          git clone --depth=1 https://github.com/Neutron-Toolchains/clang-build-catalogue.git clang-catalogue
-          CLANG_VERSION=$(cat clang-catalogue/latest.txt 2>/dev/null || echo "r547379")
-          wget -q "https://raw.githubusercontent.com/Neutron-Toolchains/clang-build-catalogue/main/$(echo $CLANG_VERSION | cut -d'-' -f1)/${CLANG_VERSION}.tar.zst" -O clang.tar.zst || true
-          
-          if [ ! -f clang.tar.zst ] || [ ! -s clang.tar.zst ]; then
-            echo "回退到 AOSP Clang"
-            wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r547379.tar.gz -O clang.tar.gz
-            tar -xzf clang.tar.gz
-          else
-            zstd -d clang.tar.zst -o clang.tar
-            tar -xf clang.tar
-          fi
-          
-          # 查找 clang 目录
-          CLANG_DIR=$(find $PWD -maxdepth 2 -type d -name "clang-*" | head -n1)
-          if [ -z "$CLANG_DIR" ]; then
-            CLANG_DIR=$(find $PWD -maxdepth 2 -type d -name "clang" | head -n1)
-          fi
-          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
-          echo "Clang 路径: $CLANG_DIR"
-          $CLANG_DIR/bin/clang --version
+          cd $GITHUB_WORKSPACE/kernel
+          chmod +x build_bouquet.sh
+          ./build_bouquet.sh
+          mkdir -p ~/dist
+          cp -r ~/Bouquet_marble_out/. ~/dist/
+          ls -lh ~/dist
 
-      - name: 克隆 GCC 工具链
+      - name: 编译 KernelSU 版本 Image
+        if: ${{ github.event_name == 'push' || inputs.build_ksu }}
         run: |
-          cd ${{ github.workspace }}/toolchain
-          git clone --depth=1 https://github.com/gcc-mirror/gcc.git gcc-aarch64 2>/dev/null || true
-          # 使用预编译的 GCC 交叉工具链
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          [ -d ~/KernelSU ] || git clone --depth=1 https://github.com/tiann/KernelSU.git ~/KernelSU
+          cd $GITHUB_WORKSPACE/kernel
+          ./build_bouquet.sh --noclean --ksu -- Image
+          cp -f ~/Bouquet_marble_out/Image_ksu* ~/dist/
 
-      - name: 配置构建环境
+      - name: 编译 KernelSU + SUSFS 版本 Image
+        if: ${{ github.event_name == 'push' || inputs.build_susfs }}
+        continue-on-error: true          # susfs 补丁可能与新内核有冲突，失败不中断流程
         run: |
-          echo "PATH=${{ github.workspace }}/toolchain/clang/bin:$PATH" >> $GITHUB_ENV
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
-          
-          # 设置构建变量
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
-          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          [ -d ~/susfs4ksu ] || \
+            git clone --depth=1 -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+          cd $GITHUB_WORKSPACE/kernel
+          ./build_bouquet.sh --susfs -- Image
+          cp -f ~/Bouquet_marble_out/Image_susfs* ~/dist/
 
-      - name: 执行编译
-        run: |
-          cd ${{ github.workspace }}
-          
-          # 确保 build.sh 有执行权限
-          chmod +x build.sh 2>/dev/null || true
-          
-          # 设置线程数
-          export MAKE_ARGS="-j$(nproc --all)"
-          
-          # 执行构建（根据仓库结构使用 build.sh）
-          if [ -f build.sh ]; then
-            echo "使用 build.sh 构建..."
-            bash build.sh \
-              -C \
-              --build-variant=user \
-              -j$(nproc --all) 2>&1 | tee build.log
-          else
-            echo "未找到 build.sh，尝试 make 直接构建..."
-            make O=out ARCH=arm64 \
-              CC=clang \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              marble_defconfig 2>&1 | tee build.log
-            make O=out ARCH=arm64 \
-              CC=clang \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              -j$(nproc --all) 2>&1 | tee -a build.log
-          fi
-          
-          echo "构建退出码: $?"
-
-      - name: 打包产物
+      - name: ccache 统计
         if: always()
-        run: |
-          cd ${{ github.workspace }}
-          mkdir -p artifacts
-          
-          # 查找 Image 文件
-          find . -name "Image" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          find . -name "Image.gz" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          find . -name "Image.lz4" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          
-          # 查找 dtb / dtbo
-          find . -name "*.dtb" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          find . -name "dtbo.img" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          
-          # 查找内核模块
-          find . -name "*.ko" -type f 2>/dev/null | while read f; do
-            cp "$f" artifacts/ 2>/dev/null || true
-          done
-          
-          # 列出产物
-          echo "=== 构建产物列表 ==="
-          ls -lh artifacts/ || true
-          
-          # 创建压缩包
-          cd artifacts
-          if [ "$(ls -A .)" ]; then
-            zip -r ../kernel-artifacts-$(date +%Y%m%d-%H%M%S).zip . 2>/dev/null || true
-          fi
+        run: ccache --show-stats
 
-      - name: 上传构建产物
+      # ---------- 5. 打包 AnyKernel3 卡刷包 ----------
+      - name: 打包 AnyKernel3
+        if: ${{ (github.event_name == 'push' || inputs.package_ak3) }}
+        run: |
+          set -e
+          git clone --depth=1 -b ${{ env.AK3_BRANCH }} ${{ env.AK3_REPO }} ~/AnyKernel3
+          cd ~/AnyKernel3
+
+          rm -f ./Image*
+          cp -f ~/dist/devicetree/ukee.dtb    ./_dtb/dtb
+          cp -f ~/dist/devicetree/dtbo.img    ./_dtb/dtbo.img
+          cp -f ~/dist/alt_kernel_modules/*   ./_modules_hyperos/_alt/
+          cp -f ~/dist/vendor_boot_modules/*  ./_modules_hyperos/_vendor_boot_modules/
+          cp -f ~/dist/vendor_dlkm_modules/*  ./_modules_hyperos/_vendor_dlkm_modules/
+          cp -f ~/dist/Image*                 ./
+
+          python3 ./make_package.py "ci-${BUILD_DATE}-${SHORT_SHA}"
+          ls -lh ~/AnyKernel3/*.zip
+
+      # ---------- 6. 上传产物 ----------
+      - name: 上传卡刷包
+        if: ${{ (github.event_name == 'push' || inputs.package_ak3) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bouquet-Kernel-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
+          path: ~/AnyKernel3/Bouquet-Kernel-*.zip
+          if-no-files-found: error
+
+      - name: 上传 Image / 模块 / dtb（fastboot 直刷用）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-artifacts-${{ github.run_number }}
+          name: kernel-images-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
           path: |
-            kernel-artifacts-*.zip
-            artifacts/
-          retention-days: 30
-
-      - name: 上传构建日志
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ github.run_number }}
-          path: build.log
-          retention-days: 7
+            ~/dist/Image*
+            ~/dist/vendor_boot_modules/
+            ~/dist/vendor_dlkm_modules/
+            ~/dist/devicetree/
+          if-no-files-found: warn
