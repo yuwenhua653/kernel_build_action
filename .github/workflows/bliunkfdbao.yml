@@ -11,16 +11,19 @@
 #     默认分支 melt-rebase，因此不需要 fork。
 #
 # 【已修复的问题（2026-10 实测失败记录）】
-#   现象: 编译到 drivers/built-in.a 后无任何报错即失败:
-#     make: *** [common/Makefile:196: __sub-make] Error 2
-#   原因: GitHub 标准 runner 只有 7GB 内存 / ~14GB 磁盘，而 MSM+GKI
-#     双内核树编译量极大，build.sh 默认 -j$(nproc)=4 路并行打爆内存(OOM)，
-#     且全量同步 clang 工具链占用过大，编译中途被系统杀死，无报错直接退出。
-#   修复(本文件已内置):
-#     1) MAKEFLAGS=-j2     并行度降到 2，内存占用减半
-#     2) 创建 4GB swapfile 兜底内存峰值
-#     3) clang 只同步构建配置固定的 clang-r416183b 单一版本，省 ~15GB 磁盘
-#     4) 保留 common-modules 项目同步，消除缺失类失败
+#   第一轮: make: *** [common/Makefile:196: __sub-make] Error 2
+#     - 初判资源问题，实际经完整日志排查确认为**上游源码编译缺陷**（见下）。
+#     - 保留的加固: MAKEFLAGS=-j2、4GB swap（dd 方式）、clang 收窄到
+#       clang-r416183b、ubuntu-22.04、失败自诊断输出。
+#   真正的根因（已从上游源码逐一确认）:
+#     techpack/eva/msm/Kbuild 中 obj-m += msm-eva.o 会无条件编译 eva 模块，
+#     其 msm_cvp_internal.h 使用 struct synx_session 字段，而 synx_api.h
+#     只在 CONFIG_MSM_GLOBAL_SYNX 开启时才定义该结构体；上游 gki_defconfig
+#     未开启该选项（vendor/parrot_GKI.config 里有 CONFIG_MSM_GLOBAL_SYNX=m，
+#     但构建流程没有应用该片段）→ 编译报
+#     "field has incomplete type 'struct synx_session'" 后失败。
+#   修复: 在 checkout 后把 CONFIG_MSM_GLOBAL_SYNX=m 补进 gki_defconfig
+#     （见下方 "Patch defconfig" 步骤）。=m 为模块，不影响 GKI vmlinux/ABI。
 #
 # 说明:
 #   - 上游默认分支 melt-rebase 本身没有 CI。该分支是标准 AOSP ACK
@@ -107,6 +110,25 @@ jobs:
           repository: Pzqqt/android_kernel_xiaomi_marble   # 上游仓库，无需 fork
           ref: melt-rebase                                  # 上游默认分支
           path: common
+
+      # ------------------------------------------------------------
+      # 4b. 修复上游树的编译缺陷：为 gki_defconfig 启用 CONFIG_MSM_GLOBAL_SYNX
+      #     根因（已从源码确认）:
+      #       - techpack/eva/msm/Kbuild 里 obj-m += msm-eva.o 无条件编译 eva 模块；
+      #       - eva 的 msm_cvp_internal.h 使用 struct synx_session 字段，
+      #         而 synx_api.h 只在 CONFIG_MSM_GLOBAL_SYNX 开启时才定义该结构体；
+      #       - 上游 gki_defconfig 未开启它（vendor/parrot_GKI.config 里有
+      #         CONFIG_MSM_GLOBAL_SYNX=m，但该片段未被构建流程应用）
+      #       → 编译报 "field has incomplete type 'struct synx_session'"
+      #     修复: 直接把 CONFIG_MSM_GLOBAL_SYNX=m 补进 gki_defconfig
+      #       （GKI 与 vendor 两个子构建都使用该 defconfig；=m 为模块，
+      #         不影响 GKI vmlinux 与 ABI 检查）
+      # ------------------------------------------------------------
+      - name: Patch defconfig (enable MSM_GLOBAL_SYNX)
+        run: |
+          grep -q "^CONFIG_MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig || \
+            echo "CONFIG_MSM_GLOBAL_SYNX=m" >> common/arch/arm64/configs/gki_defconfig
+          grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig
 
       # ------------------------------------------------------------
       # 5. 创建 swap 兜底内存峰值（7GB 内存编译大内核容易 OOM）
