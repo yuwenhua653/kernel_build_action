@@ -1,0 +1,216 @@
+name: Build Melt Kernel (marble)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: '内核源码仓库 (owner/repo)，可填自己的 fork'
+        required: true
+        default: 'Pzqqt/android_kernel_xiaomi_marble'
+      KERNEL_BRANCH:
+        description: '内核分支 (melt-rebase / bouquet / 自己改的分支)'
+        required: true
+        default: 'melt-rebase'
+      LLVM_VERSION:
+        description: 'Slim LLVM 工具链版本 (kernel.org 镜像)'
+        required: true
+        default: '23.1.1'
+      BUILD_SUSFS:
+        description: '额外构建 KernelSU+susfs 变体'
+        type: boolean
+        required: true
+        default: true
+      KSU_REF:
+        description: 'KernelSU 分支/tag（留空 = main 最新）'
+        required: false
+        default: ''
+      AK3_BRANCH:
+        description: 'AnyKernel3 打包分支 (Melt 用 Marble-Melt，Bouquet 用 Marble-Bouquet)'
+        required: true
+        default: 'Marble-Melt'
+      BUILD_SCRIPT_REF:
+        description: '内核树内无 build_bouquet.sh 时，从上游哪个分支获取'
+        required: true
+        default: 'bouquet_ci'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+    steps:
+      - name: Cleanup runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h
+
+      - name: Restore Slim LLVM from cache
+        id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/build_toolchain/llvm-${{ inputs.LLVM_VERSION }}-x86_64.tar.xz
+          key: llvm-${{ inputs.LLVM_VERSION }}-x86_64
+
+      - name: Download Slim LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        env:
+          LLVM_VERSION: ${{ inputs.LLVM_VERSION }}
+        run: |
+          sudo apt-get install -y aria2
+          mkdir -p ~/build_toolchain
+          cd ~/build_toolchain
+          aria2c -x16 -s16 \
+            "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${LLVM_VERSION}-x86_64.tar.xz"
+
+      - name: Prepare environment
+        env:
+          LLVM_VERSION: ${{ inputs.LLVM_VERSION }}
+        run: |
+          mkdir -p ~/.local/bin ~/dist
+          sudo apt-get install -y ccache python3 python-is-python3 python3-rich
+
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
+
+          cd ~/build_toolchain
+          tar -xJf "./llvm-${LLVM_VERSION}-x86_64.tar.xz"
+
+          echo "Installing 7za ..."
+          mkdir -p /tmp/7z2603-linux-x64
+          cd /tmp/7z2603-linux-x64
+          wget -nv https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz
+          tar -xJf ./7z2603-linux-x64.tar.xz
+          cp ./7zzs ~/.local/bin/7za
+          cd ~ && rm -rf /tmp/7z2603-linux-x64
+
+          echo "Installing HDiffPatch ..."
+          mkdir -p /tmp/hdiffpatch
+          cd /tmp/hdiffpatch
+          wget -nv https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip
+          ~/.local/bin/7za x ./hdiffpatch_v4.12.2_bin_linux64.zip
+          cp ./linux64/hdiffz ./linux64/hpatchz ~/.local/bin/
+          cd ~ && rm -rf /tmp/hdiffpatch
+
+          chmod +x ~/.local/bin/*
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          ccache --max-size=2G
+          ccache --zero-stats
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.KERNEL_REPO }}
+          ref: ${{ inputs.KERNEL_BRANCH }}
+          fetch-depth: 1
+          # 如果 KERNEL_REPO 是私有仓库，需要改用有权限的 PAT：
+          # token: ${{ secrets.YOUR_PAT }}
+
+      - name: Prepare build script
+        env:
+          LLVM_VERSION: ${{ inputs.LLVM_VERSION }}
+          BUILD_SCRIPT_REF: ${{ inputs.BUILD_SCRIPT_REF }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          if [ ! -f ./build_bouquet.sh ]; then
+            echo "内核树内无构建脚本，从上游 ${BUILD_SCRIPT_REF} 分支获取 build_bouquet.sh"
+            curl -fSL -o ./build_bouquet.sh \
+              "https://raw.githubusercontent.com/Pzqqt/android_kernel_xiaomi_marble/${BUILD_SCRIPT_REF}/build_bouquet.sh"
+          fi
+          chmod +x ./build_bouquet.sh
+          # 脚本内写死了 LLVM 23.1.1，如更换版本则同步替换工具链路径
+          sed -i "s|llvm-23.1.1-x86_64|llvm-${LLVM_VERSION}-x86_64|g" ./build_bouquet.sh
+          echo "KERNEL_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          echo "Kernel HEAD: $(git rev-parse HEAD)"
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-melt-${{ inputs.KERNEL_BRANCH }}-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-melt-${{ inputs.KERNEL_BRANCH }}-${{ runner.os }}-
+
+      - name: Build kernel Image & modules
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh
+
+      - name: Clone KernelSU
+        env:
+          KSU_REF: ${{ inputs.KSU_REF }}
+        run: |
+          cd ~
+          git clone https://github.com/tiann/KernelSU.git
+          if [ -n "$KSU_REF" ]; then
+            cd ~/KernelSU
+            git checkout "$KSU_REF"
+          fi
+
+      - name: Build kernel Image with KernelSU
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh --noclean --ksu -- Image
+
+      - name: Build kernel Image with KernelSU & susfs
+        if: ${{ inputs.BUILD_SUSFS }}
+        continue-on-error: true
+        run: |
+          cd ~
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 --depth=1
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh --susfs -- Image
+
+      - name: Show ccache stats
+        run: ccache --show-stats
+
+      - name: Collect artifacts
+        run: |
+          cd ~/Bouquet_marble_out
+          cp -f Image Image_vmlinux.symvers ~/dist/
+          if [ -f Image_ksu ];   then cp -f Image_ksu   ~/dist/; fi
+          if [ -f Image_susfs ]; then cp -f Image_susfs ~/dist/; fi
+          cp -r devicetree vendor_boot_modules vendor_dlkm_modules alt_kernel_modules ~/dist/
+          ls -lR ~/dist | head -n 60 || true
+
+      - name: Package AnyKernel3 zip
+        env:
+          AK3_BRANCH: ${{ inputs.AK3_BRANCH }}
+        run: |
+          cd ~
+          git clone https://github.com/Pzqqt/AnyKernel3.git -b "$AK3_BRANCH" --depth=1
+          cd AnyKernel3
+
+          rm -f ./Image*
+          cp -f ~/dist/devicetree/ukee.dtb   ./_dtb/dtb
+          cp -f ~/dist/devicetree/dtbo.img   ./_dtb/dtbo.img
+          cp -f ~/dist/alt_kernel_modules/*  ./_modules_hyperos/_alt/
+          cp -f ~/dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/
+          cp -f ~/dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/
+
+          cp -f ~/dist/Image ./Image
+          if [ -f ~/dist/Image_ksu ];   then cp -f ~/dist/Image_ksu   ./Image_ksu;   fi
+          if [ -f ~/dist/Image_susfs ]; then cp -f ~/dist/Image_susfs ./Image_susfs; fi
+          cp -f ~/dist/Image_vmlinux.symvers ./Image_vmlinux.symvers
+
+          # Marble-Melt 分支的 make_package.py 写死了作者本机路径，
+          # 改为相对路径（与作者 CI 用的 Marble-Bouquet 分支一致）
+          sed -i "s|/home/pzqqt/working/android_kernel_xiaomi_marble/out/vmlinux.symvers|Image_vmlinux.symvers|" make_package.py
+
+          python3 ./make_package.py "ci-${BUILD_DATE}-${KERNEL_SHA}"
+
+      - name: Generate checksums
+        run: |
+          cd ~/AnyKernel3
+          sha256sum ./*.zip | tee checksums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Melt-marble-ci-${{ env.BUILD_DATE }}-${{ env.KERNEL_SHA }}
+          path: |
+            ~/AnyKernel3/*.zip
+            ~/AnyKernel3/checksums.txt
+          if-no-files-found: error
+          archive: false
