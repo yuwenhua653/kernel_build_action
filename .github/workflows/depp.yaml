@@ -1,0 +1,181 @@
+name: Build Melt Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: '自定义内核版本号（留空则自动生成）'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 python-is-python3
+
+      - name: 配置 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-
+            ccache-
+
+      - name: 克隆工具链
+        run: |
+          mkdir -p ${{ github.workspace }}/toolchain
+          cd ${{ github.workspace }}/toolchain
+          
+          # 克隆预编译 clang（Neutron Clang，适用于 5.10 内核）
+          git clone --depth=1 https://github.com/Neutron-Toolchains/clang-build-catalogue.git clang-catalogue
+          CLANG_VERSION=$(cat clang-catalogue/latest.txt 2>/dev/null || echo "r547379")
+          wget -q "https://raw.githubusercontent.com/Neutron-Toolchains/clang-build-catalogue/main/$(echo $CLANG_VERSION | cut -d'-' -f1)/${CLANG_VERSION}.tar.zst" -O clang.tar.zst || true
+          
+          if [ ! -f clang.tar.zst ] || [ ! -s clang.tar.zst ]; then
+            echo "回退到 AOSP Clang"
+            wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r547379.tar.gz -O clang.tar.gz
+            tar -xzf clang.tar.gz
+          else
+            zstd -d clang.tar.zst -o clang.tar
+            tar -xf clang.tar
+          fi
+          
+          # 查找 clang 目录
+          CLANG_DIR=$(find $PWD -maxdepth 2 -type d -name "clang-*" | head -n1)
+          if [ -z "$CLANG_DIR" ]; then
+            CLANG_DIR=$(find $PWD -maxdepth 2 -type d -name "clang" | head -n1)
+          fi
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "Clang 路径: $CLANG_DIR"
+          $CLANG_DIR/bin/clang --version
+
+      - name: 克隆 GCC 工具链
+        run: |
+          cd ${{ github.workspace }}/toolchain
+          git clone --depth=1 https://github.com/gcc-mirror/gcc.git gcc-aarch64 2>/dev/null || true
+          # 使用预编译的 GCC 交叉工具链
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: 配置构建环境
+        run: |
+          echo "PATH=${{ github.workspace }}/toolchain/clang/bin:$PATH" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+          
+          # 设置构建变量
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+
+      - name: 执行编译
+        run: |
+          cd ${{ github.workspace }}
+          
+          # 确保 build.sh 有执行权限
+          chmod +x build.sh 2>/dev/null || true
+          
+          # 设置线程数
+          export MAKE_ARGS="-j$(nproc --all)"
+          
+          # 执行构建（根据仓库结构使用 build.sh）
+          if [ -f build.sh ]; then
+            echo "使用 build.sh 构建..."
+            bash build.sh \
+              -C \
+              --build-variant=user \
+              -j$(nproc --all) 2>&1 | tee build.log
+          else
+            echo "未找到 build.sh，尝试 make 直接构建..."
+            make O=out ARCH=arm64 \
+              CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              marble_defconfig 2>&1 | tee build.log
+            make O=out ARCH=arm64 \
+              CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              -j$(nproc --all) 2>&1 | tee -a build.log
+          fi
+          
+          echo "构建退出码: $?"
+
+      - name: 打包产物
+        if: always()
+        run: |
+          cd ${{ github.workspace }}
+          mkdir -p artifacts
+          
+          # 查找 Image 文件
+          find . -name "Image" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          find . -name "Image.gz" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          find . -name "Image.lz4" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          
+          # 查找 dtb / dtbo
+          find . -name "*.dtb" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          find . -name "dtbo.img" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          
+          # 查找内核模块
+          find . -name "*.ko" -type f 2>/dev/null | while read f; do
+            cp "$f" artifacts/ 2>/dev/null || true
+          done
+          
+          # 列出产物
+          echo "=== 构建产物列表 ==="
+          ls -lh artifacts/ || true
+          
+          # 创建压缩包
+          cd artifacts
+          if [ "$(ls -A .)" ]; then
+            zip -r ../kernel-artifacts-$(date +%Y%m%d-%H%M%S).zip . 2>/dev/null || true
+          fi
+
+      - name: 上传构建产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts-${{ github.run_number }}
+          path: |
+            kernel-artifacts-*.zip
+            artifacts/
+          retention-days: 30
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          retention-days: 7
