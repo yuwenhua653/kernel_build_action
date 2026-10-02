@@ -1,0 +1,270 @@
+# 保存到你自己仓库的默认分支：.github/workflows/build-marble.yml
+# 独立编译 Pzqqt/android_kernel_xiaomi_marble 的内核 Image。
+# 产物 ZIP 是 GitHub 下载归档，不是 Recovery 刷机包，也不是 boot.img。
+# 核对源码：melt-rebase @ 3c0a6dd8a767ac7e401bf9238fa2a93f974a4cfe
+# 可将 kernel_ref 改成该 SHA，固定到本次检查的源码版本。
+name: Build Marble Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repository:
+        description: '源码仓库（owner/repo；可填写你的 Fork）'
+        required: true
+        default: 'Pzqqt/android_kernel_xiaomi_marble'
+        type: string
+      kernel_ref:
+        description: '内核分支、标签或完整提交 SHA'
+        required: true
+        default: 'melt-rebase'
+        type: string
+      jobs:
+        description: '编译并发数；2 比较省内存，可改成 4'
+        required: true
+        default: '2'
+        type: choice
+        options:
+          - '2'
+          - '4'
+
+permissions:
+  contents: read
+
+# 再次手动运行不会中断前一次编译。
+concurrency:
+  group: marble-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARCH: arm64
+      DEFCONFIG: marble_defconfig
+      LLVM_VERSION: '23.1.1'
+      LLVM_SHA256: '4511aee50112bf96d8f5108daa8bc1b99283fab51d37068758f91b9217940129'
+      JOBS: ${{ inputs.jobs }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}/kernel
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
+      KBUILD_BUILD_USER: github
+      KBUILD_BUILD_HOST: actions
+      TZ: UTC
+      LANG: C.UTF-8
+
+    steps:
+      - name: Initialize logs and validate inputs
+        env:
+          SOURCE_REPO: ${{ inputs.kernel_repository }}
+          SOURCE_REF: ${{ inputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics dist
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo '::error::源码仓库必须使用 owner/repo 格式'; exit 1;
+          }
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" != -* && "$SOURCE_REF" != *$'\n'* ]] || {
+            echo '::error::无效的源码 ref'; exit 1;
+          }
+          [[ "$JOBS" == 2 || "$JOBS" == 4 ]] || exit 1
+          {
+            printf 'repository=%s\nrequested_ref=%s\n' "$SOURCE_REPO" "$SOURCE_REF"
+            printf 'workflow_run=%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'build_started_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > diagnostics/build-info.txt
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repository }}
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex ccache curl ca-certificates \
+            libssl-dev libelf-dev libncurses-dev zlib1g-dev \
+            python3 perl rsync file xz-utils gzip lz4 kmod
+          {
+            df -h "$GITHUB_WORKSPACE"
+            free -h
+          } | tee diagnostics/runner-info.txt
+          # 仅在 GitHub 临时 runner 上创建本任务专用 swap。
+          # 预留 25 GiB 后才创建，避免将磁盘占满。
+          free_kb=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if (( free_kb > 35 * 1024 * 1024 )); then
+            sudo fallocate -l 8G /swap-marble-actions
+            sudo chmod 600 /swap-marble-actions
+            sudo mkswap /swap-marble-actions
+            sudo swapon /swap-marble-actions
+          else
+            echo '::notice::磁盘空间不足以增加 swap，使用 runner 现有内存与 swap。'
+          fi
+          ccache --max-size="$CCACHE_MAXSIZE"
+
+      - name: Download and verify Slim LLVM
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marble-llvm"
+          archive="llvm-${LLVM_VERSION}-x86_64.tar.xz"
+          url="https://mirrors.edge.kernel.org/pub/tools/llvm/files/${archive}"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --connect-timeout 30 --max-time 900 \
+            "$url" -o "$RUNNER_TEMP/marble-llvm/$archive"
+          printf '%s  %s\n' "$LLVM_SHA256" "$RUNNER_TEMP/marble-llvm/$archive" | sha256sum -c -
+          tar --no-same-owner -xJf "$RUNNER_TEMP/marble-llvm/$archive" -C "$RUNNER_TEMP/marble-llvm"
+          toolchain="$RUNNER_TEMP/marble-llvm/llvm-${LLVM_VERSION}-x86_64/bin"
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            test -x "$toolchain/$tool" || { echo "::error::工具链缺少 $tool"; exit 1; }
+          done
+          echo "$toolchain" >> "$GITHUB_PATH"
+          "$toolchain/clang" --version | tee diagnostics/clang-version.txt
+          printf 'llvm_archive_sha256=%s\n' "$LLVM_SHA256" >> diagnostics/build-info.txt
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: marble-image-${{ runner.os }}-llvm23.1.1-${{ inputs.kernel_repository }}-${{ inputs.kernel_ref }}-${{ github.run_id }}
+          restore-keys: |
+            marble-image-${{ runner.os }}-llvm23.1.1-${{ inputs.kernel_repository }}-${{ inputs.kernel_ref }}-
+
+      - name: Configure and compile kernel Image
+        id: compile
+        run: |
+          set -euo pipefail
+          src="$GITHUB_WORKSPACE/kernel"
+          out="$src/out"
+          logs="$GITHUB_WORKSPACE/diagnostics"
+          test -s "$src/arch/arm64/configs/$DEFCONFIG" || {
+            echo "::error::选中的源码没有 $DEFCONFIG，请使用 melt-rebase 或其兼容分支。"; exit 1;
+          }
+          commit=$(git -C "$src" rev-parse HEAD)
+          short_sha=${commit:0:12}
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          # 内核编译时间使用本次 CI 的真实时间，不伪装成源码提交时间。
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %d %H:%M:%S UTC %Y')"
+          export LOCALVERSION="-ci-${short_sha}"
+          {
+            printf 'source_commit=%s\n' "$commit"
+            printf 'source_commit_date=%s\n' "$(git -C "$src" show -s --format=%cI HEAD)"
+            printf 'defconfig=%s\nlocalversion=%s\njobs=%s\n' "$DEFCONFIG" "$LOCALVERSION" "$JOBS"
+            printf 'kbuild_timestamp=%s\n' "$KBUILD_BUILD_TIMESTAMP"
+            printf 'make_target=Image\n'
+          } >> "$logs/build-info.txt"
+          make_args=(
+            -C "$src" O="$out" ARCH=arm64 LLVM=1 LLVM_IAS=1
+            'KCFLAGS=-D__ANDROID_COMMON_KERNEL__ -O3'
+            "KBUILD_LDFLAGS=-O3 --lto-O3 --thinlto-jobs=$JOBS"
+          )
+          ccache --zero-stats
+          make "${make_args[@]}" "$DEFCONFIG" 2>&1 | tee "$logs/configure.log"
+          cp "$out/.config" "$logs/kernel.config"
+          # 源 defconfig 请求 Polly，但 arch/Kconfig 会在编译器不支持时自动关闭它。
+          # 以生成后的 .config 为准；若仍开启，则提前检查全部参数。
+          if grep -qx 'CONFIG_LLVM_POLLY=y' "$out/.config"; then
+            printf 'int f(int x) { return x + 1; }\n' | \
+              clang --target=aarch64-linux-gnu -O2 -x c -c -o "$RUNNER_TEMP/polly-check.o" - \
+                -mllvm -polly -mllvm -polly-run-inliner \
+                -mllvm -polly-ast-use-context -mllvm -polly-detect-keep-going \
+                -mllvm -polly-invariant-load-hoisting -mllvm -polly-vectorizer=stripmine \
+                -mllvm -polly-loopfusion-greedy=1 -mllvm -polly-reschedule=1 \
+                -mllvm -polly-postopts=1 -mllvm -polly-num-threads=0 \
+                -mllvm -polly-omp-backend=LLVM -mllvm -polly-scheduling=dynamic \
+                -mllvm -polly-scheduling-chunksize=1 \
+              2>&1 | tee "$logs/polly-check.log"
+          else
+            echo 'Polly is disabled by Kconfig because this toolchain does not support it.' | tee "$logs/polly-check.log"
+          fi
+          grep -E '^(CONFIG_(LTO|CFI|LLVM_POLLY)|# CONFIG_LLVM_POLLY)' "$out/.config" >> "$logs/build-info.txt" || true
+          # Image-only 是有意选择：不将新 Clang 生成的模块当作作者的 Clang 12 模块替换包。
+          # pipefail 保证 make 失败时 job 失败，不会被 tee 的成功状态掩盖。
+          make "${make_args[@]}" -j"$JOBS" Image 2>&1 | tee "$logs/build.log"
+          test -s "$out/arch/arm64/boot/Image"
+          cp "$out/arch/arm64/boot/Image" dist/Image
+          gzip -n -9 -c dist/Image > dist/Image.gz
+          cp "$out/.config" dist/kernel.config
+          cp "$out/System.map" dist/System.map
+          for filename in vmlinux.symvers Module.symvers; do
+            if [[ -s "$out/$filename" ]]; then
+              cp "$out/$filename" "dist/$filename"
+            fi
+          done
+          cp "$out/include/config/kernel.release" dist/kernel.release
+          file dist/Image | tee "$logs/image-info.txt"
+          {
+            printf 'kernel_release=%s\n' "$(cat dist/kernel.release)"
+            printf 'build_finished_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$logs/build-info.txt"
+          cp "$logs/build-info.txt" "$logs/clang-version.txt" dist/
+          cat > dist/README.txt <<'EOF'
+          本目录是 Pzqqt/android_kernel_xiaomi_marble 的 Image 编译产物。
+          默认使用 melt-rebase + marble_defconfig；没有额外加入 KernelSU 或 SUSFS。
+          Image 是原始内核二进制，Image.gz 是同一镜像的 gzip 压缩副本。
+          它们不是 boot.img；GitHub 下载的 artifacts ZIP 不是 Recovery 刷机包。
+          此流程不生成 DTB/DTBO、vendor_boot/vendor_dlkm 模块替换包，不复刻作者完整发行包。
+          需要使用与当前 ROM 匹配的 boot 打包或安装流程，不能直接 fastboot flash boot Image。
+          编译通过不等于已验证 KMI、ROM 兼容性或实机开机。
+          源码提交、编译时间及工具链记录见 build-info.txt / clang-version.txt。
+          EOF
+          (
+            cd dist
+            sha256sum Image Image.gz kernel.config System.map kernel.release build-info.txt clang-version.txt README.txt > SHA256SUMS
+            for filename in vmlinux.symvers Module.symvers; do
+              if [[ -f "$filename" ]]; then sha256sum "$filename" >> SHA256SUMS; fi
+            done
+          )
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats | tee diagnostics/ccache-stats.txt
+          fi
+          if [[ -f kernel/out/.config ]]; then
+            cp kernel/out/.config diagnostics/kernel.config
+          fi
+          if [[ -f kernel/out/include/config/kernel.release ]]; then
+            cp kernel/out/include/config/kernel.release diagnostics/kernel.release
+          fi
+          if [[ -f diagnostics/build-info.txt ]]; then
+            {
+              echo '### Marble kernel build'
+              echo '```text'
+              cat diagnostics/build-info.txt
+              echo '```'
+              echo '产物为原始内核镜像；artifacts ZIP 不是刷机包。'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload kernel images
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel-${{ steps.compile.outputs.short_sha }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload logs even if compilation fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-build-logs-${{ github.run_number }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
