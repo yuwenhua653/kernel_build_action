@@ -141,6 +141,12 @@ jobs:
           fi
           cat "$FRAG" >> "$DEFC"
           echo "已合并 vendor/parrot_GKI.config ($(wc -l < "$FRAG") 行) 到 gki_defconfig"
+          # 关闭 CONFIG_WERROR（Kconfig 默认 y，gki_defconfig 未显式设置）:
+          # techpack 第三方代码大量 unused 警告被 -Werror 升级为错误；
+          # 无任何配置 select WERROR，defconfig 关闭必定生效（与构建系统透传无关）
+          grep -q "^# CONFIG_WERROR is not set" "$DEFC" || \
+            echo "# CONFIG_WERROR is not set" >> "$DEFC"
+          grep -n "CONFIG_WERROR" "$DEFC"
           grep -n "CONFIG_QCOM_MDT_LOADER\|CONFIG_QCOM_SCM\|CONFIG_MSM_GLOBAL_SYNX\|CONFIG_QCOM_MEM_BUF" "$DEFC" | tail -4
           # [2] 修复 qcom_scm.h 残缺 stub（分号 + 漏掉的 inline，兜底）
           python3 -c "import re; p='common/include/linux/qcom_scm.h'; s=open(p).read(); f=re.sub(r'(static inline (?:[^;]|\n)*?);\n(\s*\{ return -ENODEV; \})', r'\1\n\2', s); f=f.replace('static void *qcom_get_scm_device(void)', 'static inline void *qcom_get_scm_device(void)'); assert f!=s, 'qcom_scm.h 未匹配到待修复代码，上游可能已更新'; open(p,'w').write(f); print('qcom_scm.h 修复完成')"
