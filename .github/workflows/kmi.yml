@@ -34,18 +34,19 @@ jobs:
           repository: Pzqqt/android_kernel_xiaomi_marble   # ← 显式指定上游仓库
           ref: ${{ inputs.branch || 'melt-rebase' }}        # ← 固定默认 melt-rebase
 
-      # ---------- 2. 从 bouquet_ci 分支借用官方构建脚本与工具 ----------
+            # ---------- 2. 从 bouquet_ci 分支借用官方构建脚本与工具 ----------
       - name: Fetch official build script & build-tools
         run: |
           git clone --depth=1 --filter=blob:none --sparse \
             -b bouquet_ci \
             https://github.com/Pzqqt/android_kernel_xiaomi_marble.git /tmp/marble_ci
           cd /tmp/marble_ci
-          git sparse-checkout set build_bouquet.sh build-tools
+          git sparse-checkout set --no-cone '/build_bouquet.sh' '/build-tools/'
           cp build_bouquet.sh "$GITHUB_WORKSPACE/"
           cp -r build-tools "$GITHUB_WORKSPACE/"
           chmod +x "$GITHUB_WORKSPACE/build_bouquet.sh"
           chmod +x "$GITHUB_WORKSPACE"/build-tools/* || true
+
 
       # ---------- 3. 准备环境变量与基础依赖 ----------
       - name: Prepare environment
