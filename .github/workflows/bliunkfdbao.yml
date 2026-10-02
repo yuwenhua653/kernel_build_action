@@ -10,10 +10,22 @@
 #   - 工作流用 actions/checkout 的 repository 参数直接拉取上游内核仓库的
 #     默认分支 melt-rebase，因此不需要 fork。
 #
+# 【已修复的问题（2026-10 实测失败记录）】
+#   现象: 编译到 drivers/built-in.a 后无任何报错即失败:
+#     make: *** [common/Makefile:196: __sub-make] Error 2
+#   原因: GitHub 标准 runner 只有 7GB 内存 / ~14GB 磁盘，而 MSM+GKI
+#     双内核树编译量极大，build.sh 默认 -j$(nproc)=4 路并行打爆内存(OOM)，
+#     且全量同步 clang 工具链占用过大，编译中途被系统杀死，无报错直接退出。
+#   修复(本文件已内置):
+#     1) MAKEFLAGS=-j2     并行度降到 2，内存占用减半
+#     2) 创建 4GB swapfile 兜底内存峰值
+#     3) clang 只同步构建配置固定的 clang-r416183b 单一版本，省 ~15GB 磁盘
+#     4) 保留 common-modules 项目同步，消除缺失类失败
+#
 # 说明:
 #   - 上游默认分支 melt-rebase 本身没有 CI。该分支是标准 AOSP ACK
 #     (android12-5.10 MSM) 内核树，本工作流按 AOSP 官方文档方式编译:
-#       repo init/sync (获取 kernel/build 构建系统 + 全部预编译工具链)
+#       repo init/sync (获取 kernel/build 构建系统 + 预编译工具链)
 #       BUILD_CONFIG=common/build.config.msm.parrot build/build.sh
 #   - build.config.msm.parrot 会做「GKI + vendor」混合构建，产物包含
 #     boot.img / vendor_boot.img / dtbo.img / dtb / Image / 内核模块等，
@@ -42,7 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BUILD_CONFIG: common/build.config.msm.parrot
-      LTO: thin   # 标准 runner 只有 7GB 内存，thin LTO 防止 OOM（官方推荐 <24GB 内存用）
+      LTO: thin   # <24GB 内存必须用 thin LTO，官方推荐
+      MAKEFLAGS: -j2   # 标准 runner 只有 7GB 内存，4 路并行必 OOM；-j2 最稳
     steps:
       # ------------------------------------------------------------
       # 1. 释放磁盘空间：标准 runner 只有 ~14GB，先清掉预装的大组件
@@ -66,17 +79,23 @@ jobs:
           repo --version
 
       # ------------------------------------------------------------
-      # 3. 同步 AOSP 构建环境（kernel/build 构建系统 + clang/gas/build-tools 预编译）
+      # 3. 同步 AOSP 构建环境（kernel/build 构建系统 + 预编译工具链）
       #    manifest: kernel/manifest 分支 common-android12-5.10
-      #    用 sed 从清单里剔除 stock common/common-modules，稍后换成 Melt 源码
+      #    - 剔除清单中的 stock common 项目（稍后换成 Melt 源码）
+      #    - 保留 common-modules（避免构建系统引用缺失）
+      #    - 把 clang 从全版本 master 收窄到构建配置指定的 clang-r416183b
+      #      （build.config.common 里 CLANG_PREBUILT_BIN 固定用它，省 ~15GB）
       # ------------------------------------------------------------
       - name: Sync AOSP build environment
         run: |
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b common-android12-5.10
-          # 跳过清单中的通用内核项目（会替换为下方拉取的 Melt 源码）
-          sed -i '/path="common"/d; /path="common-modules"/d' .repo/manifests/*.xml
-          repo sync -c -j$(nproc)
+          # 去掉 stock common（稍后由上游 Melt 源码替换）
+          sed -i '/path="common"/d' .repo/manifests/*.xml
+          # 收窄 clang 版本（若清单格式不匹配则跳过，不影响构建）
+          sed -i 's#path="prebuilts-master/clang/host/linux-x86" name="platform/prebuilts/clang/host/linux-x86" revision="master"#path="prebuilts-master/clang/host/linux-x86" name="platform/prebuilts/clang/host/linux-x86" revision="clang-r416183b"#' \
+            .repo/manifests/*.xml
+          repo sync -c -j4
 
       # ------------------------------------------------------------
       # 4. 直接拉取上游内核源码（无需 fork！指定 repository 即可）
@@ -90,7 +109,19 @@ jobs:
           path: common
 
       # ------------------------------------------------------------
-      # 5. 编译内核（GKI + vendor 混合构建）
+      # 5. 创建 swap 兜底内存峰值（7GB 内存编译大内核容易 OOM）
+      # ------------------------------------------------------------
+      - name: Create swapfile (4GB)
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      # ------------------------------------------------------------
+      # 6. 编译内核（GKI + vendor 混合构建）
       #    产物目录: out/android12-5.10/dist/ (boot.img, vendor_boot.img,
       #              dtbo.img, dtb.img, Image, vmlinux.symvers, 内核模块...)
       # ------------------------------------------------------------
@@ -99,14 +130,14 @@ jobs:
           BUILD_CONFIG=common/build.config.msm.parrot LTO=thin build/build.sh
 
       # ------------------------------------------------------------
-      # 6. 列出产物（便于排查）
+      # 7. 列出产物（便于排查）
       # ------------------------------------------------------------
       - name: List build outputs
         run: |
           find out -maxdepth 4 -type d -name dist -exec ls -lh {} \;
 
       # ------------------------------------------------------------
-      # 7. 上传产物到 Actions 页面，可下载
+      # 8. 上传产物到 Actions 页面，可下载
       # ------------------------------------------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
