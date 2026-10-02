@@ -113,7 +113,11 @@ jobs:
       # ------------------------------------------------------------
       - name: Create swapfile (4GB)
         run: |
-          sudo fallocate -l 4G /swapfile
+          # runner 上 fallocate 会报 Text file busy（已知问题），改用 dd 写盘；
+          # 先清掉已有 swap 保证步骤可重复执行（幂等）
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
