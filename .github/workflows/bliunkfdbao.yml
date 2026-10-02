@@ -119,11 +119,12 @@ jobs:
       #         而 synx_api.h 只在 CONFIG_MSM_GLOBAL_SYNX 开启时才定义该结构体；
       #       - 上游 gki_defconfig 未开启它 → "field has incomplete type"
       #       修复: 追加 CONFIG_MSM_GLOBAL_SYNX=m（=m 为模块，不影响 GKI vmlinux/ABI）
-      #   [2] 修复 include/linux/qcom_scm.h 的残缺 stub
-      #       - CONFIG_QCOM_SCM 未开启时走 #else 分支，其中有 3 个
-      #         "static inline ...;" 声明后残留独立的 "{ return -ENODEV; }"
-      #         → "expected identifier or '('"（cvp_dump.o 编译失败）
-      #       修复: 去掉声明末尾的多余分号，让函数体正常接上
+      #   [2] 修复 include/linux/qcom_scm.h 的残缺 stub（CONFIG_QCOM_SCM 未开启的 #else 分支）
+      #       a) 3 个 "static inline ...;" 声明后残留独立的 "{ return -ENODEV; }"
+      #          → "expected identifier or '('"（cvp_dump.o 首报）
+      #       b) qcom_get_scm_device 是裸 static（漏了 inline），未使用时被
+      #          CONFIG_WERROR=-Werror 升级为 "unused function" 错误
+      #       修复: 去掉声明末尾的多余分号；为该函数补上 inline
       # ------------------------------------------------------------
       - name: Patch upstream source (synx + qcom_scm.h)
         run: |
@@ -131,9 +132,9 @@ jobs:
           grep -q "^CONFIG_MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig || \
             echo "CONFIG_MSM_GLOBAL_SYNX=m" >> common/arch/arm64/configs/gki_defconfig
           grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig
-          # [2] 修复 qcom_scm.h 残缺 stub
-          python3 -c "import re; p='common/include/linux/qcom_scm.h'; s=open(p).read(); f=re.sub(r'(static inline (?:[^;]|\n)*?);\n(\s*\{ return -ENODEV; \})', r'\1\n\2', s); assert f!=s, 'qcom_scm.h 未匹配到残缺 stub，上游可能已更新'; open(p,'w').write(f); print('qcom_scm.h 修复完成')"
-          grep -n "qcom_scm_lmh_dcvsh\|qcom_scm_lmh_profile_change\|qcom_scm_lmh_dcvsh_available" common/include/linux/qcom_scm.h
+          # [2] 修复 qcom_scm.h 残缺 stub（分号 + 漏掉的 inline）
+          python3 -c "import re; p='common/include/linux/qcom_scm.h'; s=open(p).read(); f=re.sub(r'(static inline (?:[^;]|\n)*?);\n(\s*\{ return -ENODEV; \})', r'\1\n\2', s); f=f.replace('static void *qcom_get_scm_device(void)', 'static inline void *qcom_get_scm_device(void)'); assert f!=s, 'qcom_scm.h 未匹配到待修复代码，上游可能已更新'; open(p,'w').write(f); print('qcom_scm.h 修复完成')"
+          grep -n "qcom_scm_lmh_dcvsh\|qcom_scm_lmh_profile_change\|qcom_scm_lmh_dcvsh_available\|qcom_get_scm_device" common/include/linux/qcom_scm.h
 
       # ------------------------------------------------------------
       # 5. 创建 swap 兜底内存峰值（7GB 内存编译大内核容易 OOM）
