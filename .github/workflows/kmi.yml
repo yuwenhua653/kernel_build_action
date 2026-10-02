@@ -1,0 +1,169 @@
+name: Build Melt Kernel (marble)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "要编译的分支"
+        required: true
+        default: "melt-rebase"
+        type: string
+      with_susfs:
+        description: "额外编译 susfs 版本（编译时间翻倍）"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - melt-rebase
+
+env:
+  CCACHE_DIR: /home/runner/.ccache
+  LLVM_DIR: /home/runner/build_toolchain
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      # ---------- 1. 检出内核源码 ----------
+      - name: Check out kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref_name || 'melt-rebase' }}
+
+      # ---------- 2. 从 bouquet_ci 分支借用官方构建脚本与工具 ----------
+      - name: Fetch official build script & build-tools
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            -b bouquet_ci \
+            https://github.com/Pzqqt/android_kernel_xiaomi_marble.git /tmp/marble_ci
+          cd /tmp/marble_ci
+          git sparse-checkout set build_bouquet.sh build-tools
+          cp build_bouquet.sh "$GITHUB_WORKSPACE/"
+          cp -r build-tools "$GITHUB_WORKSPACE/"
+          chmod +x "$GITHUB_WORKSPACE/build_bouquet.sh"
+          chmod +x "$GITHUB_WORKSPACE"/build-tools/* || true
+
+      # ---------- 3. 准备环境变量与基础依赖 ----------
+      - name: Prepare environment
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA:0:12}" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 python-is-python3 python3-rich aria2 wget xz-utils unzip
+          mkdir -p ~/.local/bin ~/dist "$LLVM_DIR"
+
+      # ---------- 4. Slim LLVM 23.1.1（带缓存） ----------
+      - name: Restore Slim LLVM cache
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/build_toolchain/llvm-23.1.1-x86_64.tar.xz
+          key: slim-llvm-23.1.1-x86_64
+
+      - name: Download Slim LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$LLVM_DIR"
+          aria2c -x 8 https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-23.1.1-x86_64.tar.xz
+
+      # ---------- 5. 解压 LLVM + 安装打包工具(7za / hdiffz) ----------
+      - name: Setup toolchain and packaging tools
+        run: |
+          cd "$LLVM_DIR"
+          tar -xJf ./llvm-23.1.1-x86_64.tar.xz
+          "$LLVM_DIR/llvm-23.1.1-x86_64/bin/clang" --version
+
+          # 7za (make_package.py 依赖)
+          wget -nv https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz -O /tmp/7z.tar.xz
+          mkdir -p /tmp/7z && tar -xJf /tmp/7z.tar.xz -C /tmp/7z
+          cp /tmp/7z/7zzs ~/.local/bin/7za
+
+          # hdiffz (生成 KSU 差分包用)
+          wget -nv https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip -O /tmp/hdiff.zip
+          mkdir -p /tmp/hdiff && unzip -q /tmp/hdiff.zip -d /tmp/hdiff
+          cp /tmp/hdiff/linux64/hdiffz /tmp/hdiff/linux64/hpatchz ~/.local/bin/
+          chmod +x ~/.local/bin/*
+
+          ccache --max-size=2G
+          ccache --zero-stats
+
+      # ---------- 6. ccache 缓存（二次编译大幅提速） ----------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-marble-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-marble-${{ runner.os }}-
+
+      # ---------- 7. 编译原版内核（Image + 全部模块 + dtb/dtbo） ----------
+      - name: Build kernel (stock)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          bash ./build_bouquet.sh
+          cp -r ~/Bouquet_marble_out/* ~/dist/
+
+      # ---------- 8. 编译 KernelSU 版本（增量，只重编 Image） ----------
+      - name: Build kernel (KernelSU)
+        run: |
+          git clone https://github.com/tiann/KernelSU.git ~/KernelSU
+          cd "$GITHUB_WORKSPACE"
+          bash ./build_bouquet.sh --noclean --ksu -- Image
+          cp ~/Bouquet_marble_out/Image_ksu* ~/dist/
+
+      # ---------- 9. 可选：编译 susfs 版本（全量重编，允许失败） ----------
+      - name: Build kernel (KernelSU + susfs)
+        if: inputs.with_susfs == true
+        continue-on-error: true
+        run: |
+          git clone --depth=1 -b gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+          cd "$GITHUB_WORKSPACE"
+          bash ./build_bouquet.sh --susfs -- Image
+          cp ~/Bouquet_marble_out/Image_susfs* ~/dist/
+
+      - name: Show ccache stats
+        run: ccache --show-stats
+
+      # ---------- 10. AnyKernel3 打包（刷入时可用音量键选原版/KSU） ----------
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 -b Marble-Bouquet \
+            https://github.com/Pzqqt/AnyKernel3.git ~/AnyKernel3
+          cd ~/AnyKernel3
+
+          # 把包名和内核名从 Bouquet 改为 Melt
+          sed -i 's/Bouquet-Kernel-/Melt-Kernel-/' make_package.py
+          sed -i 's/kernel.string=Bouquet Kernel/kernel.string=Melt Kernel/' anykernel.sh
+
+          rm -f ./Image*
+          cp -f ~/dist/devicetree/ukee.dtb   ./_dtb/dtb
+          cp -f ~/dist/devicetree/dtbo.img   ./_dtb/dtbo.img
+          cp -f ~/dist/alt_kernel_modules/*  ./_modules_hyperos/_alt/
+          cp -f ~/dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/
+          cp -f ~/dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/
+          cp -f ~/dist/Image* ./
+
+          python3 ./make_package.py "ci-${BUILD_DATE}-${SHORT_SHA}"
+
+      # ---------- 11. 上传产物 ----------
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melt-Kernel-ci-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
+          path: /home/runner/AnyKernel3/Melt-Kernel-*.zip
+          if-no-files-found: error
+
+      - name: Upload raw images
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-images-${{ env.SHORT_SHA }}
+          path: |
+            /home/runner/dist/Image
+            /home/runner/dist/Image_ksu
+            /home/runner/dist/devicetree/dtbo.img
+            /home/runner/dist/devicetree/ukee.dtb
+          if-no-files-found: ignore
