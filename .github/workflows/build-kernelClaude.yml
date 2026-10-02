@@ -28,7 +28,7 @@ env:
   CLANG_REPO: "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
   CLANG_DIR: ${{ github.workspace }}/toolchain/neutron-clang
   # ── Kernel config ──────────────────────────────────────────────────────
-  DEFCONFIG: vendor/marble_defconfig
+  DEFCONFIG: marble_defconfig
   ARCH: arm64
   # ── AnyKernel3 ─────────────────────────────────────────────────────────
   ANYKERNEL_REPO: "https://github.com/osm0sis/AnyKernel3"
