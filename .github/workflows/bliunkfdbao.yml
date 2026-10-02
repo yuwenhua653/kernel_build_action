@@ -51,7 +51,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # 固定 22.04：与 android12-5.10 内核年代匹配，host gcc 兼容性最稳
     env:
       BUILD_CONFIG: common/build.config.msm.parrot
       LTO: thin   # <24GB 内存必须用 thin LTO，官方推荐
@@ -128,10 +128,27 @@ jobs:
       # 6. 编译内核（GKI + vendor 混合构建）
       #    产物目录: out/android12-5.10/dist/ (boot.img, vendor_boot.img,
       #              dtbo.img, dtb.img, Image, vmlinux.symvers, 内核模块...)
+      #    失败时自动采集退出码/内存/磁盘/OOM 证据，便于定位
       # ------------------------------------------------------------
       - name: Build kernel
         run: |
+          set +e
           BUILD_CONFIG=common/build.config.msm.parrot LTO=thin build/build.sh
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "===== build.sh 退出码: $rc ====="
+            echo "===== 失败后内存/磁盘状态 ====="
+            free -h
+            df -h
+            echo "===== 内核日志中的 OOM / 磁盘错误证据 ====="
+            (sudo dmesg -T 2>/dev/null || journalctl -k -n 40 2>/dev/null) \
+              | tail -n 40 | grep -iE "killed process|out of memory|oom|no space|drm" || true
+            echo "===== 已编译产物规模（判断编译到哪一步）====="
+            find out -name '*.o' 2>/dev/null | wc -l
+            du -sh out 2>/dev/null || true
+            exit "$rc"
+          fi
+          echo "===== 编译成功 ====="
 
       # ------------------------------------------------------------
       # 7. 列出产物（便于排查）
