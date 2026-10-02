@@ -27,11 +27,12 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      # ---------- 1. 检出内核源码 ----------
+            # ---------- 1. 检出内核源码 ----------
       - name: Check out kernel source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch || github.ref_name || 'melt-rebase' }}
+          repository: Pzqqt/android_kernel_xiaomi_marble   # ← 显式指定上游仓库
+          ref: ${{ inputs.branch || 'melt-rebase' }}        # ← 固定默认 melt-rebase
 
       # ---------- 2. 从 bouquet_ci 分支借用官方构建脚本与工具 ----------
       - name: Fetch official build script & build-tools
