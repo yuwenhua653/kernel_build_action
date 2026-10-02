@@ -1,0 +1,194 @@
+name: Build Marble Kernel
+run-name: Build ${{ github.event.inputs.kernel_branch || 'melt-rebase' }} (${{ github.sha }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "要编译的分支/标签（melt-rebase / bouquet / bouquet_ci / 你自己的分支）"
+        required: true
+        default: "melt-rebase"
+      build_ksu:
+        description: "编译 KernelSU 版内核（AK3 打包必需）"
+        type: boolean
+        default: true
+      build_susfs:
+        description: "编译 KernelSU + susfs 版内核"
+        type: boolean
+        default: true
+  # 可选：推送时自动编译（按需取消注释）
+  # push:
+  #   branches: [bouquet_ci]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: /home/runner/.ccache
+  LLVM_VERSION: "23.1.1"
+  LLVM_TARBALL: "llvm-23.1.1-x86_64.tar.xz"
+  LLVM_URL: "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-23.1.1-x86_64.tar.xz"
+  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'melt-rebase' }}
+  BUILD_KSU: ${{ github.event.inputs.build_ksu || 'true' }}
+  BUILD_SUSFS: ${{ github.event.inputs.build_susfs || 'true' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Prepare environment
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
+          mkdir -p ~/.local/bin
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison libssl-dev libelf-dev bc \
+            ccache python3 python-is-python3 python3-rich \
+            aria2 wget xz-utils
+          ccache --max-size=2G
+
+      # ---------- Slim LLVM（只缓存压缩包，和作者 CI 一致） ----------
+      - name: Restore Slim LLVM cache
+        id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/build_toolchain/${{ env.LLVM_TARBALL }}
+          key: slim-${{ env.LLVM_TARBALL }}
+
+      - name: Download Slim LLVM ${{ env.LLVM_VERSION }}
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/build_toolchain
+          aria2c -x8 -s8 -d ~/build_toolchain -o "${LLVM_TARBALL}" "${LLVM_URL}"
+
+      - name: Extract Slim LLVM
+        run: |
+          tar -xJf ~/build_toolchain/${LLVM_TARBALL} -C ~/build_toolchain
+          ~/build_toolchain/llvm-${LLVM_VERSION}-x86_64/bin/clang --version
+
+      # ---------- make_package.py 依赖的 7za / hdiffz ----------
+      - name: Install 7-Zip (7za)
+        run: |
+          rm -rf /tmp/7z && mkdir -p /tmp/7z && cd /tmp/7z
+          wget -nv https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz
+          tar -xJf 7z2603-linux-x64.tar.xz
+          install -m 755 7zzs ~/.local/bin/7za
+
+      - name: Install HDiffPatch (hdiffz/hpatchz)
+        run: |
+          rm -rf /tmp/hdiff && mkdir -p /tmp/hdiff && cd /tmp/hdiff
+          wget -nv https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip
+          ~/.local/bin/7za x hdiffpatch_v4.12.2_bin_linux64.zip > /dev/null
+          install -m 755 linux64/hdiffz linux64/hpatchz ~/.local/bin/
+
+      # ---------- 检出内核源码 ----------
+      - name: Check out kernel source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-marble-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-marble-${{ runner.os }}-
+
+      # melt-rebase 等分支没有 build_bouquet.sh / build-tools，自动从 bouquet_ci 借一份
+      - name: Fetch build_bouquet.sh & build-tools if missing
+        run: |
+          chmod +x ./build_bouquet.sh 2>/dev/null || true
+          if [ -f ./build_bouquet.sh ] && [ -d ./build-tools ]; then
+            echo "In-tree build script found."
+            exit 0
+          fi
+          echo "This branch has no build script, fetching from bouquet_ci ..."
+          rm -rf /tmp/bouquet_ci
+          git clone --filter=blob:none --sparse --depth=1 \
+            -b bouquet_ci https://github.com/Pzqqt/android_kernel_xiaomi_marble.git /tmp/bouquet_ci
+          git -C /tmp/bouquet_ci sparse-checkout set build-tools
+          [ -f ./build_bouquet.sh ] || cp /tmp/bouquet_ci/build_bouquet.sh ./
+          [ -d ./build-tools ]   || cp -r /tmp/bouquet_ci/build-tools ./
+          chmod +x ./build_bouquet.sh
+
+      # ---------- KernelSU / susfs 源码（build_bouquet.sh 约定放在 ~ 下） ----------
+      - name: Prepare KernelSU / susfs sources
+        run: |
+          if [ "$BUILD_KSU" = "true" ] || [ "$BUILD_SUSFS" = "true" ]; then
+            rm -rf ~/KernelSU
+            git clone https://github.com/tiann/KernelSU.git ~/KernelSU
+          fi
+          if [ "$BUILD_SUSFS" = "true" ]; then
+            rm -rf ~/susfs4ksu
+            git clone -b gki-android12-5.10 --depth=1 \
+              https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+          fi
+
+      # ---------- 编译：普通版（Image + 全部模块 + dtb/dtbo） ----------
+      - name: Build kernel (stock)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh
+          ccache --show-stats
+
+      # ---------- 编译：KernelSU 版（只重编 Image） ----------
+      - name: Build kernel (KernelSU)
+        if: env.BUILD_KSU == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh --noclean --ksu -- Image
+
+      # ---------- 编译：KernelSU + susfs 版 ----------
+      - name: Build kernel (KernelSU + susfs)
+        if: env.BUILD_SUSFS == 'true'
+        continue-on-error: true
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./build_bouquet.sh --susfs -- Image
+
+      # ---------- AnyKernel3 打包 ----------
+      - name: Package AnyKernel3 zip
+        if: env.BUILD_KSU == 'true'
+        run: |
+          set -e
+          rm -rf ~/AnyKernel3
+          git clone -b Marble-Bouquet --depth=1 \
+            https://github.com/Pzqqt/AnyKernel3.git ~/AnyKernel3
+          cd ~/AnyKernel3
+          rm -f ./Image*
+          cp -f ~/Bouquet_marble_out/devicetree/ukee.dtb   ./_dtb/dtb
+          cp -f ~/Bouquet_marble_out/devicetree/dtbo.img   ./_dtb/dtbo.img
+          cp -f ~/Bouquet_marble_out/alt_kernel_modules/*  ./_modules_hyperos/_alt/
+          cp -f ~/Bouquet_marble_out/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/
+          cp -f ~/Bouquet_marble_out/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/
+          cp -f ~/Bouquet_marble_out/Image* ./
+          python3 ./make_package.py "ci-${BUILD_DATE}-${SHORT_SHA}"
+
+      - name: Upload AK3 flashable zip
+        if: env.BUILD_KSU == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Bouquet-Kernel-ci-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
+          path: ~/AnyKernel3/Bouquet-Kernel-ci-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}.zip
+          if-no-files-found: error
+
+      # 未启用 KSU 时没有卡刷包，直接上传裸产物
+      - name: Upload raw kernel artifacts
+        if: env.BUILD_KSU != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
+          path: |
+            ~/Bouquet_marble_out/Image*
+            ~/Bouquet_marble_out/devicetree/
+            ~/Bouquet_marble_out/vendor_boot_modules/
+            ~/Bouquet_marble_out/vendor_dlkm_modules/
+          if-no-files-found: error
