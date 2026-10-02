@@ -112,23 +112,28 @@ jobs:
           path: common
 
       # ------------------------------------------------------------
-      # 4b. 修复上游树的编译缺陷：为 gki_defconfig 启用 CONFIG_MSM_GLOBAL_SYNX
-      #     根因（已从源码确认）:
+      # 4b. 修复上游树的编译缺陷（两处，均已从源码确认根因）:
+      #   [1] gki_defconfig 启用 CONFIG_MSM_GLOBAL_SYNX
       #       - techpack/eva/msm/Kbuild 里 obj-m += msm-eva.o 无条件编译 eva 模块；
       #       - eva 的 msm_cvp_internal.h 使用 struct synx_session 字段，
       #         而 synx_api.h 只在 CONFIG_MSM_GLOBAL_SYNX 开启时才定义该结构体；
-      #       - 上游 gki_defconfig 未开启它（vendor/parrot_GKI.config 里有
-      #         CONFIG_MSM_GLOBAL_SYNX=m，但该片段未被构建流程应用）
-      #       → 编译报 "field has incomplete type 'struct synx_session'"
-      #     修复: 直接把 CONFIG_MSM_GLOBAL_SYNX=m 补进 gki_defconfig
-      #       （GKI 与 vendor 两个子构建都使用该 defconfig；=m 为模块，
-      #         不影响 GKI vmlinux 与 ABI 检查）
+      #       - 上游 gki_defconfig 未开启它 → "field has incomplete type"
+      #       修复: 追加 CONFIG_MSM_GLOBAL_SYNX=m（=m 为模块，不影响 GKI vmlinux/ABI）
+      #   [2] 修复 include/linux/qcom_scm.h 的残缺 stub
+      #       - CONFIG_QCOM_SCM 未开启时走 #else 分支，其中有 3 个
+      #         "static inline ...;" 声明后残留独立的 "{ return -ENODEV; }"
+      #         → "expected identifier or '('"（cvp_dump.o 编译失败）
+      #       修复: 去掉声明末尾的多余分号，让函数体正常接上
       # ------------------------------------------------------------
-      - name: Patch defconfig (enable MSM_GLOBAL_SYNX)
+      - name: Patch upstream source (synx + qcom_scm.h)
         run: |
+          # [1] 启用 synx
           grep -q "^CONFIG_MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig || \
             echo "CONFIG_MSM_GLOBAL_SYNX=m" >> common/arch/arm64/configs/gki_defconfig
           grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig
+          # [2] 修复 qcom_scm.h 残缺 stub
+          python3 -c "import re; p='common/include/linux/qcom_scm.h'; s=open(p).read(); f=re.sub(r'(static inline (?:[^;]|\n)*?);\n(\s*\{ return -ENODEV; \})', r'\1\n\2', s); assert f!=s, 'qcom_scm.h 未匹配到残缺 stub，上游可能已更新'; open(p,'w').write(f); print('qcom_scm.h 修复完成')"
+          grep -n "qcom_scm_lmh_dcvsh\|qcom_scm_lmh_profile_change\|qcom_scm_lmh_dcvsh_available" common/include/linux/qcom_scm.h
 
       # ------------------------------------------------------------
       # 5. 创建 swap 兜底内存峰值（7GB 内存编译大内核容易 OOM）
