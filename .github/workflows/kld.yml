@@ -1,0 +1,244 @@
+name: Build Marble Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "内核仓库"
+        default: "Pzqqt/android_kernel_xiaomi_marble"
+        required: true
+      kernel_branch:
+        description: "分支 (melt-rebase / bouquet / bouquet_ci / melt-rebase-ntfs3 ...)"
+        default: "melt-rebase"
+        required: true
+      defconfig:
+        description: "defconfig"
+        default: "marble_defconfig"
+        required: true
+      root:
+        description: "Root 方案"
+        type: choice
+        options: [none, ksu, ksu+susfs]
+        default: none
+      llvm_version:
+        description: "Slim LLVM 版本 (官方模式会自动读取脚本里的版本)"
+        default: "23.1.1"
+        required: true
+
+env:
+  TZ: Asia/Shanghai
+  CCACHE_DIR: /home/runner/.ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev cpio kmod \
+            lz4 zstd xz-utils zip unzip aria2 git ccache rsync \
+            python3 python-is-python3 python3-rich p7zip-full
+          mkdir -p ~/.local/bin ~/dist
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: 拉取内核源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: 判断构建模式
+        run: |
+          cd kernel
+          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> $GITHUB_ENV
+          if [ -f build_bouquet.sh ]; then
+            echo "MODE=official" >> $GITHUB_ENV
+            V=$(grep -oP 'llvm-\K[0-9.]+(?=-x86_64)' build_bouquet.sh | head -n1)
+            echo "LLVM_VER=${V:-${{ inputs.llvm_version }}}" >> $GITHUB_ENV
+            echo ">>> 检测到 build_bouquet.sh，使用官方模式"
+          else
+            echo "MODE=generic" >> $GITHUB_ENV
+            echo "LLVM_VER=${{ inputs.llvm_version }}" >> $GITHUB_ENV
+            echo ">>> 未检测到官方脚本，使用通用 make 模式"
+          fi
+
+      - name: 缓存 LLVM
+        id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/build_toolchain/llvm-${{ env.LLVM_VER }}-x86_64.tar.xz
+          key: llvm-${{ env.LLVM_VER }}-x86_64
+
+      - name: 下载 Slim LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/build_toolchain && cd ~/build_toolchain
+          aria2c -x8 https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${LLVM_VER}-x86_64.tar.xz
+
+      - name: 解压 LLVM
+        run: |
+          cd ~/build_toolchain
+          tar -xJf llvm-${LLVM_VER}-x86_64.tar.xz
+          ~/build_toolchain/llvm-${LLVM_VER}-x86_64/bin/clang --version
+
+      - name: 准备 KernelSU / susfs
+        if: inputs.root != 'none'
+        run: |
+          cd ~
+          git clone https://github.com/tiann/KernelSU.git
+          if [ "${{ inputs.root }}" = "ksu+susfs" ]; then
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 --depth=1
+          fi
+
+      # ================= 官方模式（作者脚本） =================
+      - name: 恢复 ccache
+        if: env.MODE == 'official'
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.kernel_branch }}-${{ github.sha }}-${{ github.run_id }}
+          restore-keys: ccache-${{ inputs.kernel_branch }}-
+
+      - name: 官方模式 - 安装 7za / HDiffPatch
+        if: env.MODE == 'official'
+        run: |
+          cd /tmp
+          wget -nv https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz
+          mkdir 7z && tar -xJf 7z2603-linux-x64.tar.xz -C 7z
+          cp 7z/7zzs ~/.local/bin/7za
+          wget -nv https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip
+          7za x hdiffpatch_v4.12.2_bin_linux64.zip -ohdp
+          cp hdp/linux64/hdiffz hdp/linux64/hpatchz ~/.local/bin/
+          chmod +x ~/.local/bin/*
+          ccache --max-size=2G && ccache --zero-stats
+
+      - name: 官方模式 - 编译
+        if: env.MODE == 'official'
+        run: |
+          cd kernel
+          chmod +x build_bouquet.sh
+          ARGS="--defconfig ${{ inputs.defconfig }}"
+          ./build_bouquet.sh $ARGS
+          cp -r ~/Bouquet_marble_out/* ~/dist/
+          case "${{ inputs.root }}" in
+            ksu)
+              ./build_bouquet.sh --noclean --ksu $ARGS -- Image
+              cp ~/Bouquet_marble_out/Image_ksu* ~/dist/ ;;
+            ksu+susfs)
+              ./build_bouquet.sh --noclean --susfs $ARGS -- Image
+              cp ~/Bouquet_marble_out/Image_susfs* ~/dist/ ;;
+          esac
+          ccache --show-stats
+
+      - name: 官方模式 - AK3 打包
+        if: env.MODE == 'official'
+        run: |
+          cd ~
+          git clone https://github.com/Pzqqt/AnyKernel3.git -b Marble-Bouquet --depth=1 AnyKernel3
+          cd AnyKernel3
+          rm -f ./Image*
+          cp -f ~/dist/devicetree/ukee.dtb   ./_dtb/dtb
+          cp -f ~/dist/devicetree/dtbo.img   ./_dtb/dtbo.img
+          cp -f ~/dist/alt_kernel_modules/*  ./_modules_hyperos/_alt/
+          cp -f ~/dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/
+          cp -f ~/dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/
+          cp -f ~/dist/Image* ./
+          python3 ./make_package.py "ci-${BUILD_DATE}-${SHORT_SHA}"
+          mkdir -p ~/upload && mv ./*.zip ~/upload/
+
+      # ================= 通用模式（直接 make） =================
+      - name: 通用模式 - 集成 KernelSU / susfs
+        if: env.MODE == 'generic' && inputs.root != 'none'
+        run: |
+          cd kernel
+          mkdir -p drivers/kernelsu
+          cp -r ~/KernelSU/kernel drivers/kernelsu/kernel
+          [ -d ~/KernelSU/uapi ] && cp -r ~/KernelSU/uapi drivers/kernelsu/uapi
+          ln -sf ~/KernelSU/.git drivers/kernelsu/.git
+          sed -i '/drivers\/most\/Kconfig/asource "drivers\/kernelsu\/kernel\/Kconfig"' drivers/Kconfig
+          echo 'obj-y += kernelsu/kernel/' >> drivers/Makefile
+          if [ "${{ inputs.root }}" = "ksu+susfs" ]; then
+            cp ~/susfs4ksu/kernel_patches/fs/* fs/
+            cp ~/susfs4ksu/kernel_patches/include/linux/* include/linux/
+            git apply ~/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+            sed -e 's|a/kernel/|a/drivers/kernelsu/kernel/|g' \
+                -e 's|b/kernel/|b/drivers/kernelsu/kernel/|g' \
+                ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch | git apply
+          fi
+
+      - name: 通用模式 - 编译
+        if: env.MODE == 'generic'
+        run: |
+          cd kernel
+          export PATH=$HOME/build_toolchain/llvm-${LLVM_VER}-x86_64/bin:$PATH
+          [ -d build-tools ] && export PATH=$(pwd)/build-tools:$PATH
+          export KBUILD_BUILD_USER=github KBUILD_BUILD_HOST=ubuntu
+          export LOCALVERSION=-ci-${SHORT_SHA:0:7}
+          MAKE="make ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out"
+          KCF="-D__ANDROID_COMMON_KERNEL__ -O3"
+          LDF="-O3 --lto-O3"
+          $MAKE KCFLAGS="$KCF" KBUILD_LDFLAGS="$LDF" ${{ inputs.defconfig }}
+          if [ "${{ inputs.root }}" = "ksu+susfs" ]; then
+            scripts/config --file out/.config -d UNAME_OVERRIDE
+          fi
+          $MAKE KCFLAGS="$KCF" KBUILD_LDFLAGS="$LDF" -j$(nproc --all)
+
+      - name: 通用模式 - 收集产物并打包
+        if: env.MODE == 'generic'
+        run: |
+          OUT=$GITHUB_WORKSPACE/kernel/out
+          STRIP=$HOME/build_toolchain/llvm-${LLVM_VER}-x86_64/bin/llvm-strip
+          mkdir -p ~/dist/modules ~/dist/dtb ~/upload
+          cp $OUT/arch/arm64/boot/Image ~/dist/
+          cp $OUT/vmlinux.symvers ~/dist/ 2>/dev/null || true
+          find $OUT/arch/arm64/boot/dts -name '*.dtb'  -exec cp {} ~/dist/dtb/ \;
+          find $OUT/arch/arm64/boot -name 'dtbo.img' -exec cp {} ~/dist/dtb/ \; 2>/dev/null || true
+          find $OUT -name '*.ko' -exec cp {} ~/dist/modules/ \;
+          $STRIP --strip-debug ~/dist/modules/*.ko 2>/dev/null || true
+
+          # 只替换 Image 的 AK3 包
+          cd ~
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AK3
+          cd AK3 && rm -rf .git .github modules patch ramdisk README.md
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Melt Kernel (CI build)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          '; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i 's/^          //' anykernel.sh
+          cp ~/dist/Image ./
+          zip -r9 ~/upload/Melt-${{ inputs.kernel_branch }}-${{ inputs.root }}-${BUILD_DATE}-${SHORT_SHA}-ImageOnly-AK3.zip . -x '*.git*'
+          cd ~/dist && zip -r9 ~/upload/Melt-raw-out-${BUILD_DATE}-${SHORT_SHA}.zip .
+
+      # ================= 上传 =================
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: marble-${{ inputs.kernel_branch }}-${{ inputs.root }}-${{ env.BUILD_DATE }}-${{ env.SHORT_SHA }}
+          path: ~/upload/*
+          if-no-files-found: error
