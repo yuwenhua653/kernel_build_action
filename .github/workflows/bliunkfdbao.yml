@@ -112,27 +112,37 @@ jobs:
           path: common
 
       # ------------------------------------------------------------
-      # 4b. 修复上游树的编译缺陷（两处，均已从源码确认根因）:
-      #   [1] gki_defconfig 启用 CONFIG_MSM_GLOBAL_SYNX
-      #       - techpack/eva/msm/Kbuild 里 obj-m += msm-eva.o 无条件编译 eva 模块；
-      #       - eva 的 msm_cvp_internal.h 使用 struct synx_session 字段，
-      #         而 synx_api.h 只在 CONFIG_MSM_GLOBAL_SYNX 开启时才定义该结构体；
-      #       - 上游 gki_defconfig 未开启它 → "field has incomplete type"
-      #       修复: 追加 CONFIG_MSM_GLOBAL_SYNX=m（=m 为模块，不影响 GKI vmlinux/ABI）
+      # 4b. 修复上游树的编译缺陷，均已从源码确认根因:
+      #   [1] 合并 vendor 配置片段 vendor/parrot_GKI.config 到 gki_defconfig
+      #       - techpack 模块（eva/cvp/video/camera/rmnet…）无条件编译，
+      #         其链接所需 core 符号（qcom_mdt_load、qmi_*、mem_buf_*、
+      #         qcom_iommu_get_fault_ids…）由片段中的 CONFIG 控制：
+      #         CONFIG_QCOM_MDT_LOADER=m、CONFIG_QCOM_SCM=m、
+      #         CONFIG_QCOM_MEM_BUF=m、CONFIG_QCOM_IOMMU_UTIL=m、
+      #         CONFIG_MSM_GLOBAL_SYNX=m（synx）…
+      #       - 但 AOSP build.sh 从不应用该片段 → modpost undefined symbol
+      #       修复: 整段追加（defconfig 解析时后行覆盖前行，等价 merge_config；
+      #       已核对片段中的 "is not set" 行不会关闭 gki_defconfig 任何 =y 项）
       #   [2] 修复 include/linux/qcom_scm.h 的残缺 stub（CONFIG_QCOM_SCM 未开启的 #else 分支）
       #       a) 3 个 "static inline ...;" 声明后残留独立的 "{ return -ENODEV; }"
       #          → "expected identifier or '('"（cvp_dump.o 首报）
       #       b) qcom_get_scm_device 是裸 static（漏了 inline），未使用时被
       #          CONFIG_WERROR=-Werror 升级为 "unused function" 错误
       #       修复: 去掉声明末尾的多余分号；为该函数补上 inline
+      #       （应用 [1] 后 CONFIG_QCOM_SCM=m 走真实分支，此修复不生效但保留兜底）
       # ------------------------------------------------------------
-      - name: Patch upstream source (synx + qcom_scm.h)
+      - name: Patch upstream source (merge vendor config + fix qcom_scm.h)
         run: |
-          # [1] 启用 synx
-          grep -q "^CONFIG_MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig || \
-            echo "CONFIG_MSM_GLOBAL_SYNX=m" >> common/arch/arm64/configs/gki_defconfig
-          grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig
-          # [2] 修复 qcom_scm.h 残缺 stub（分号 + 漏掉的 inline）
+          # [1] 合并 vendor 配置片段到 gki_defconfig
+          FRAG=common/arch/arm64/configs/vendor/parrot_GKI.config
+          DEFC=common/arch/arm64/configs/gki_defconfig
+          if [ ! -f "$FRAG" ]; then
+            echo "!!! 未找到 $FRAG，上游结构可能已变，构建中止"; exit 1
+          fi
+          cat "$FRAG" >> "$DEFC"
+          echo "已合并 vendor/parrot_GKI.config ($(wc -l < "$FRAG") 行) 到 gki_defconfig"
+          grep -n "CONFIG_QCOM_MDT_LOADER\|CONFIG_QCOM_SCM\|CONFIG_MSM_GLOBAL_SYNX\|CONFIG_QCOM_MEM_BUF" "$DEFC" | tail -4
+          # [2] 修复 qcom_scm.h 残缺 stub（分号 + 漏掉的 inline，兜底）
           python3 -c "import re; p='common/include/linux/qcom_scm.h'; s=open(p).read(); f=re.sub(r'(static inline (?:[^;]|\n)*?);\n(\s*\{ return -ENODEV; \})', r'\1\n\2', s); f=f.replace('static void *qcom_get_scm_device(void)', 'static inline void *qcom_get_scm_device(void)'); assert f!=s, 'qcom_scm.h 未匹配到待修复代码，上游可能已更新'; open(p,'w').write(f); print('qcom_scm.h 修复完成')"
           grep -n "qcom_scm_lmh_dcvsh\|qcom_scm_lmh_profile_change\|qcom_scm_lmh_dcvsh_available\|qcom_get_scm_device" common/include/linux/qcom_scm.h
 
