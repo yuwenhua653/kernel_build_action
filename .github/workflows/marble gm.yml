@@ -1,0 +1,85 @@
+name: Build Melt Kernel for Xiaomi Marble (Poco F5 / Redmi Note 12 Turbo)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: Pzqqt/android_kernel_xiaomi_marble
+          # 已确认：Melt Kernel 的编译分支是 melt-rebase
+          ref: melt-rebase 
+          path: kernel
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download Toolchain (Proton Clang)
+        run: |
+          mkdir -p toolchain
+          cd toolchain
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git
+          echo "CLANG_PATH=$(pwd)/proton-clang/bin" >> $GITHUB_ENV
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          export PATH=$CLANG_PATH:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          
+          # 已确认：配置文件为 vendor/marble_defconfig
+          export DEFCONFIG=vendor/marble_defconfig
+
+          # 清理并生成 .config
+          make O=out ARCH=arm64 $DEFCONFIG
+
+          # 开启多线程编译
+          make -j$(nproc --all) \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Upload Kernel Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Image
+          path: kernel/out/arch/arm64/boot/Image
+
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          path: AnyKernel3
+
+      - name: Package with AnyKernel3
+        run: |
+          cd AnyKernel3
+          
+          # 自动修改 AnyKernel3 适配 Marble
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/block=\/dev\/block\/bootdevice\/by-name\/boot/block=auto/g' anykernel.sh
+          sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
+          
+          # 复制 Image 并打包
+          cp ../kernel/out/arch/arm64/boot/Image ./
+          zip -r9 ../Update-Melt-Kernel-Marble.zip * -x .git README.md *placeholder
+
+      - name: Upload Flashable Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Flashable-Melt-Kernel-Marble
+          path: Update-Melt-Kernel-Marble.zip
