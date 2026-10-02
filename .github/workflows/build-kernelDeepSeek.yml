@@ -1,0 +1,557 @@
+###############################################################################
+# GitHub Actions 自动编译脚本
+#   Xiaomi Marble (Redmi Note 12 Turbo / POCO F5) —— Melt Kernel
+#   内核仓库: https://github.com/Pzqqt/android_kernel_xiaomi_marble
+#
+# 已核对的事实（2026-10 抓取）
+#   * 默认分支: melt-rebase          （仓库里没有 "Melt"/"melt-rebase"→"melt" 之外的猜想）
+#   * defconfig: arch/arm64/configs/marble_defconfig （内核 5.10.269，lahaina / android12-5.10）
+#   * 仓库里 **没有** .github/workflows、没有 build.sh；根目录那堆 build.config.* 是
+#     GKI2 拆分树的残留（会 source 不存在的 common/），Google build/build.sh 用不了 →
+#     因此本脚本走 `make O=out ARCH=arm64 marble_defconfig && make Image modules` 直编。
+#   * 仓库里没有 vendor DTS → 编译不会产出 dtbo.img/dtb，卡刷包只替换 boot 分区内核。
+#   * 作者实际使用的工具链: Google clang 18 → Slim LLVM 23.1.0-rc3（都 ≥18），
+#     defconfig 里 CONFIG_LTO_CLANG_THIN=y，所以需要支持 ThinLTO 的 clang。
+#
+# 用法
+#   方式 A（推荐）: 把本文件放到内核心仓库的 .github/workflows/build-kernel.yml
+#   方式 B        : 放到你自己的仓库，env.KERNEL_REPO 已指向 Melt Kernel，会自动 clone
+#   然后 push，或在 Actions 页面点 "Run workflow" 手动触发。
+#   产物在 Action 页面底部 Artifacts；勾选 release=true 会创建 Release。
+###############################################################################
+
+name: Build Marble Kernel
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "要编译的分支或 tag（留空 = 当前触发分支）"
+        required: false
+        default: ""
+      defconfig:
+        description: "defconfig 文件名（留空 = 自动探测，通常为 marble_defconfig）"
+        required: false
+        default: ""
+      config_fragments:
+        description: "额外配置片段，空格分隔（留空 = 不加）"
+        required: false
+        default: ""
+      clang:
+        description: "Clang 工具链"
+        required: false
+        type: choice
+        default: aosp
+        options: [aosp, neutron]
+      build_jobs:
+        description: "并行编译线程数（留空 = nproc-1）"
+        required: false
+        default: ""
+      anykernel:
+        description: "打包 AnyKernel3 卡刷包"
+        required: false
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+      anykernel_repo:
+        description: "自定义 AnyKernel3 仓库（留空 = 自动：优先 Pzqqt/AnyKernel3@Marble-Melt）"
+        required: false
+        default: ""
+      kernel_image:
+        description: "指定的内核镜像文件名，如 Image.gz（留空 = 自动选择）"
+        required: false
+        default: ""
+      release:
+        description: "上传为 GitHub Release"
+        required: false
+        type: choice
+        default: "false"
+        options: ["false", "true"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ── 内核仓库 ────────────────────────────────────────────────────────────
+  KERNEL_REPO: "https://github.com/Pzqqt/android_kernel_xiaomi_marble"
+  KERNEL_BRANCH: "melt-rebase"     # 已核对：仓库默认分支
+  KERNEL_DIR: "kernel-src"         # 外部 clone 时使用的目录名
+
+  ARCH: arm64
+  TARGET_DEVICE: "marble"
+
+  # ── 工具链 ──────────────────────────────────────────────────────────────
+  CLANG_KIND: "aosp"               # aosp | neutron
+  AOSP_CLANG_BASE: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main"
+  AOSP_CLANG_CANDIDATES: "clang-r530567 clang-r522817"   # 已核对这两个在 main 分支上可下载
+  NEUTRON_URL: "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+
+  # ── AnyKernel3 ─────────────────────────────────────────────────────────
+  AK_FALLBACK_REPOS: "https://github.com/Pzqqt/AnyKernel3#Marble-Melt https://github.com/osm0sis/AnyKernel3#master"
+
+  USE_CCACHE: "1"
+
+jobs:
+  build:
+    name: Build ${{ github.ref_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      # ── 1. 源码 ─────────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Locate kernel source
+        run: |
+          set -euo pipefail
+          if [ -f Makefile ] && [ -d arch/arm64 ]; then
+            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+            echo "工作区本身就是内核源码树。"
+          else
+            echo "工作区不是内核源码树，clone ${KERNEL_REPO} ..."
+            ok="false"
+            for b in "${KERNEL_BRANCH}" melt bouquet main master; do
+              if git clone --depth=1 -b "${b}" "${KERNEL_REPO}" "${KERNEL_DIR}" 2>/dev/null; then
+                echo "已 clone 分支 ${b}"
+                ok="true"
+                break
+              fi
+              rm -rf "${KERNEL_DIR}"
+            done
+            if [ "${ok}" != "true" ]; then
+              echo "::error::clone 失败，请检查 KERNEL_REPO / KERNEL_BRANCH。"
+              exit 1
+            fi
+            rm -rf "${KERNEL_DIR}/.git"
+            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_DIR}" >> "$GITHUB_ENV"
+          fi
+
+      # ── 2. 系统依赖 ─────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache cpio curl flex \
+            gcc g++ gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi git gnupg \
+            gperf kmod libelf-dev liblz4-tool libncurses5-dev libssl-dev \
+            libxml2-utils lz4 lzop p7zip-full python3 python3-pip rsync \
+            schedtool unzip xz-utils zip zlib1g-dev
+          pip3 install --quiet dtschema || true
+          echo "依赖安装完成"
+
+      # ── 3. 探测内核信息 ─────────────────────────────────────────────────
+      - name: Detect kernel config
+        env:
+          IN_DEFCONFIG: ${{ github.event.inputs.defconfig }}
+          IN_FRAGMENTS: ${{ github.event.inputs.config_fragments }}
+          IN_JOBS: ${{ github.event.inputs.build_jobs }}
+        run: |
+          set -euo pipefail
+          cd "${KERNEL_ROOT}"
+
+          VER="$(sed -n 's/^VERSION *= *//p' Makefile | head -1)"
+          PLV="$(sed -n 's/^PATCHLEVEL *= *//p' Makefile | head -1)"
+          SLV="$(sed -n 's/^SUBLEVEL *= *//p' Makefile | head -1)"
+          echo "KERNEL_VERSION=${VER}.${PLV}.${SLV}" >> "$GITHUB_ENV"
+          echo "内核版本: ${VER}.${PLV}.${SLV}"
+
+          NPROC="$(nproc --all)"
+          if [ -n "${IN_JOBS}" ]; then
+            JOBS="${IN_JOBS}"
+          elif [ "${NPROC}" -gt 1 ]; then
+            JOBS=$(( NPROC - 1 ))
+          else
+            JOBS=1
+          fi
+          echo "JOBS=${JOBS}" >> "$GITHUB_ENV"
+          echo "并行线程: ${JOBS}"
+
+          # defconfig 探测：marble_defconfig 已核对存在
+          DEF="${IN_DEFCONFIG:-}"
+          if [ -z "${DEF}" ]; then
+            for c in \
+              arch/arm64/configs/marble_defconfig \
+              arch/arm64/configs/vendor/marble_defconfig \
+              arch/arm64/configs/defconfig \
+              arch/arm64/configs/vendor/kona-perf_defconfig ; do
+              if [ -f "${c}" ]; then DEF="${c}"; break; fi
+            done
+          fi
+          if [ -z "${DEF}" ]; then
+            DEF="$(ls arch/arm64/configs/*defconfig 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${DEF}" ] || [ ! -f "${DEF}" ]; then
+            echo "::error::找不到 defconfig，请用 defconfig 输入手动指定。"
+            ls arch/arm64/configs 2>/dev/null | head -30 || true
+            exit 1
+          fi
+          echo "DEFCONFIG_RESOLVED=${DEF}" >> "$GITHUB_ENV"
+          echo "defconfig: ${DEF}"
+
+          # 配置片段：默认不加（vendor/ 下只有别的 SoC 的片段，混进来会编错）
+          FRAG="${IN_FRAGMENTS:-}"
+          echo "CONFIG_FRAGMENTS_RESOLVED=${FRAG}" >> "$GITHUB_ENV"
+          echo "配置片段: ${FRAG:-（无）}"
+
+          # 签名/版本信息
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          echo "KERNEL_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+
+      # ── 4. ccache ───────────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 3G
+          key: marble-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            marble-${{ github.ref_name }}-
+            marble-
+
+      # ── 5. Clang 工具链 ────────────────────────────────────────────────
+      - name: Download toolchain
+        env:
+          IN_CLANG: ${{ github.event.inputs.clang }}
+        run: |
+          set -euo pipefail
+          TC="${GITHUB_WORKSPACE}/toolchain"
+          mkdir -p "${TC}"
+
+          want="${IN_CLANG:-${CLANG_KIND}}"
+          ok="false"
+
+          if [ "${want}" = "aosp" ]; then
+            for rev in ${AOSP_CLANG_CANDIDATES}; do
+              echo "尝试下载 AOSP ${rev} ..."
+              if curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 \
+                "${AOSP_CLANG_BASE}/${rev}.tar.gz" -o "${TC}/clang.tar.gz"; then
+                rm -rf "${TC}/clang"
+                mkdir -p "${TC}/clang"
+                if tar -xzf "${TC}/clang.tar.gz" -C "${TC}/clang" && [ -x "${TC}/clang/bin/clang" ]; then
+                  rm -f "${TC}/clang.tar.gz"
+                  echo "CLANG_DIR=${TC}/clang" >> "$GITHUB_ENV"
+                  echo "使用 AOSP clang ${rev}"
+                  ok="true"
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ "${ok}" != "true" ]; then
+            echo "改用 Neutron Toolchains (antman) ..."
+            mkdir -p "${TC}/neutron"
+            curl -fsSL --retry 3 --connect-timeout 20 "${NEUTRON_URL}" -o "${TC}/neutron/antman"
+            chmod +x "${TC}/neutron/antman"
+            ( cd "${TC}/neutron" && ( ./antman -S=latest || ./antman -S ) ) || true
+            if [ -x "${TC}/neutron/bin/clang" ]; then
+              echo "CLANG_DIR=${TC}/neutron" >> "$GITHUB_ENV"
+              echo "使用 Neutron clang"
+              ok="true"
+            fi
+          fi
+
+          if [ "${ok}" != "true" ]; then
+            echo "::error::Clang 工具链下载失败。"
+            exit 1
+          fi
+
+          "${CLANG_DIR}/bin/clang" --version | head -2 || true
+
+      - name: Download ARM32 GCC (可选)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          TC="${GITHUB_WORKSPACE}/toolchain"
+          base="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86"
+          for t in aarch64/aarch64-linux-android-4.9 arm/arm-linux-androideabi-4.9; do
+            n="$(basename "$t")"
+            curl -fsSL --retry 2 --connect-timeout 20 "${base}/${t}.tar.gz" -o "${n}.tar.gz" || continue
+            mkdir -p "${TC}/gcc" && tar -xzf "${n}.tar.gz" -C "${TC}/gcc" && rm -f "${n}.tar.gz"
+          done
+
+      # ── 6. 编译 ─────────────────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "${KERNEL_ROOT}"
+          export PATH="${CLANG_DIR}/bin:${PATH}"
+          clang --version | head -1 || true
+          echo "ccache: $(command -v ccache || echo 未找到)"
+
+          MAKE_ARGS=(
+            -j"${JOBS}"
+            O="${KERNEL_ROOT}/out"
+            ARCH="${ARCH}"
+            SUBARCH="${ARCH}"
+            CC="ccache clang"
+            HOSTCC="ccache clang"
+            HOSTCXX="ccache clang++"
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          BASE_CFG="$(basename "${DEFCONFIG_RESOLVED}")"
+          if [ "${DEFCONFIG_RESOLVED}" != "arch/arm64/configs/${BASE_CFG}" ]; then
+            cp -f "${DEFCONFIG_RESOLVED}" "arch/arm64/configs/${BASE_CFG}"
+          fi
+
+          echo "::group::defconfig (${BASE_CFG})"
+          make "${MAKE_ARGS[@]}" "${BASE_CFG}"
+          if [ -n "${CONFIG_FRAGMENTS_RESOLVED}" ]; then
+            for f in ${CONFIG_FRAGMENTS_RESOLVED}; do
+              [ -f "${f}" ] || continue
+              echo "叠加配置片段 -> ${f}"
+              ./scripts/kconfig/merge_config.sh -m -O out out/.config "${f}" || \
+                echo "::warning::片段 ${f} 叠加失败，已跳过"
+            done
+            make "${MAKE_ARGS[@]}" olddefconfig
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Image"
+          make "${MAKE_ARGS[@]}" Image
+          echo "::endgroup::"
+
+          echo "::group::modules"
+          if grep -qE '^CONFIG_MODULES=y' out/.config 2>/dev/null; then
+            make "${MAKE_ARGS[@]}" modules || echo "::warning::modules 编译失败（内核镜像仍可用）"
+          fi
+          echo "::endgroup::"
+
+          echo "产物概览："
+          find out -maxdepth 6 -type f \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.lz4" \
+              -o -name "Image-dtb" -o -name "Image.gz-dtb" \
+              -o -name "vmlinux" -o -name "vmlinux.symvers" -o -name "*.ko" \) \
+            -printf '%p  %k KB\n' 2>/dev/null | head -40 || true
+
+      # ── 7. 收集产物 ────────────────────────────────────────────────────
+      - name: Collect artifacts
+        if: always()
+        env:
+          IN_KIMG: ${{ github.event.inputs.kernel_image }}
+        run: |
+          set -euo pipefail
+          cd "${KERNEL_ROOT}"
+          A="${GITHUB_WORKSPACE}/artifacts"
+          rm -rf "${A}"
+          mkdir -p "${A}/modules"
+
+          KIMG=""
+          if [ -n "${IN_KIMG}" ]; then
+            KIMG="$(find out -maxdepth 6 -type f -name "${IN_KIMG}" 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${KIMG}" ]; then
+            for c in \
+              out/arch/arm64/boot/Image \
+              out/arch/arm64/boot/Image.gz \
+              out/arch/arm64/boot/Image.lz4 \
+              out/arch/arm64/boot/Image.gz-dtb ; do
+              if [ -f "${c}" ]; then KIMG="${c}"; break; fi
+            done
+          fi
+          if [ -z "${KIMG}" ]; then
+            KIMG="$(find out -maxdepth 6 -type f \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.lz4' \) 2>/dev/null | head -1 || true)"
+          fi
+
+          if [ -n "${KIMG}" ]; then
+            cp -f "${KIMG}" "${A}/"
+            echo "KERNEL_IMAGE=${KIMG}" >> "$GITHUB_ENV"
+            echo "KERNEL_IMAGE_NAME=$(basename "${KIMG}")" >> "$GITHUB_ENV"
+            echo "内核镜像: ${KIMG}"
+          else
+            echo "::warning::没找到内核镜像，请检查编译日志。"
+          fi
+
+          # vmlinux / System.map 方便后续排查
+          for f in out/vmlinux out/System.map; do
+            [ -f "${f}" ] && cp -f "${f}" "${A}/" || true
+          done
+
+          # 内核模块（marble 的 vendor_dlkm 模块，卡刷包里按需带上）
+          find out -type f -name "*.ko" -exec cp -f {} "${A}/modules/" \; 2>/dev/null || true
+          # 顺带收集可能出现的 dtb/dtbo
+          if find out -type f -name "*.dtb" 2>/dev/null | grep -q .; then
+            mkdir -p "${A}/dtbs"
+            find out -type f -name "*.dtb" -exec cp -f {} "${A}/dtbs/" \; 2>/dev/null || true
+          fi
+          for c in out/arch/arm64/boot/dtbo.img out/arch/arm64/boot/dtb.img; do
+            if [ -f "${c}" ]; then cp -f "${c}" "${A}/"; break; fi
+          done
+
+          ls -lhR "${A}" | head -50
+
+      # ── 8. 打包 AnyKernel3 卡刷包 ──────────────────────────────────────
+      - name: Package AnyKernel3 zip
+        if: always() && env.KERNEL_IMAGE != '' && inputs.anykernel != 'false'
+        env:
+          AK_REPO: ${{ github.event.inputs.anykernel_repo }}
+        run: |
+          set -euo pipefail
+          A="${GITHUB_WORKSPACE}/artifacts"
+          AK="${GITHUB_WORKSPACE}/AnyKernel3"
+          rm -rf "${AK}"
+
+          # 取 AnyKernel3 骨架（需要 tools/ak3-core.sh、META-INF、magiskboot 等运行时代码）
+          clone_ak() {
+            repo="${1%%#*}"
+            br="${1#*#}"
+            [ "${br}" = "${repo}" ] && br="master"
+            git clone --depth=1 -b "${br}" "${repo}" "${AK}" >/dev/null 2>&1 || { rm -rf "${AK}"; return 1; }
+            if [ -f "${AK}/tools/ak3-core.sh" ]; then
+              rm -rf "${AK}/.git"
+              return 0
+            fi
+            rm -rf "${AK}"
+            return 1
+          }
+
+          got="false"
+          if [ -n "${AK_REPO}" ]; then
+            clone_ak "${AK_REPO}" && got="true"
+          else
+            for r in ${AK_FALLBACK_REPOS}; do
+              if clone_ak "${r}"; then echo "使用 AnyKernel3 骨架: ${r}"; got="true"; break; fi
+            done
+          fi
+          if [ "${got}" != "true" ]; then
+            echo "::error::AnyKernel3 骨架获取失败，可用 anykernel_repo 指定仓库。"
+            exit 1
+          fi
+
+          # 生成 marble 专用的 anykernel.sh（覆盖骨架里的模板/作者专用脚本）
+          # 属性取自作者自己的 AK3 配置（Pzqqt/AnyKernel3@Marble-Melt）
+          # 说明：ak3-core.sh 的 flash_boot 会自动在压缩包根目录按
+          #   zImage → Image → Image.gz → Image.lz4 … 的顺序查找内核镜像，
+          #   所以这里只需要 dump_boot / write_boot，不需要手动搬运镜像。
+          cat > "${AK}/anykernel.sh" <<'AKEOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## marble | Redmi Note 12 Turbo / POCO F5
+          ## 由 GitHub Actions 自动生成（骨架来自 AnyKernel3）
+          properties() { '
+          kernel.string=@KERNEL_NAME@
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          block=boot
+          is_slot_device=1
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          no_magisk_check=true
+
+          . tools/ak3-core.sh
+
+          # 内核镜像 @KIMG@ 放在压缩包根目录，flash_boot 会自动识别
+          dump_boot
+          write_boot
+          AKEOF
+
+          IN_KIMG="${KERNEL_IMAGE_NAME:-Image}"
+          echo "使用内核镜像: ${IN_KIMG}"
+          sed -i \
+            -e "s|@KIMG@|${IN_KIMG}|g" \
+            -e "s|@KERNEL_NAME@|Melt Kernel for marble (${KERNEL_VERSION:-} ${KERNEL_SHA:-})|g" \
+            "${AK}/anykernel.sh"
+
+          # 放入编译产物
+          cp -f "${A}/${IN_KIMG}" "${AK}/"
+          if [ -d "${A}/dtbs" ]; then
+            mkdir -p "${AK}/dtbs"
+            cp -f "${A}/dtbs/"*.dtb "${AK}/dtbs/"
+          fi
+          [ -f "${A}/dtbo.img" ] && cp -f "${A}/dtbo.img" "${AK}/" || true
+
+          ZIP="Melt-marble-${BUILD_DATE}-${KERNEL_SHA}.zip"
+          ( cd "${AK}" && zip -r9 "${GITHUB_WORKSPACE}/${ZIP}" . -x ".git*" "*.md" >/dev/null )
+          echo "ZIP_NAME=${ZIP}" >> "$GITHUB_ENV"
+          ls -lh "${GITHUB_WORKSPACE}/${ZIP}"
+
+      # ── 9. 上传 Artifacts ──────────────────────────────────────────────
+      - name: Upload kernel image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-${{ github.run_number }}
+          path: |
+            artifacts/Image*
+            artifacts/vmlinux
+            artifacts/System.map
+            artifacts/*.img
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload AnyKernel3 zip
+        if: always() && env.ZIP_NAME != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3-${{ github.run_number }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 14
+
+      - name: Upload modules and dtbs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-dtbs-${{ github.run_number }}
+          path: |
+            artifacts/modules
+            artifacts/dtbs
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ── 10. Release（可选） ────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: always() && inputs.release == 'true' && env.ZIP_NAME != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "melt-marble-${{ env.BUILD_DATE }}-${{ github.run_number }}"
+          name: "Melt Kernel marble ${{ env.BUILD_DATE }} (${{ env.KERNEL_SHA }})"
+          body: |
+            - 内核仓库: ${{ env.KERNEL_REPO }}
+            - 分支: ${{ github.ref_name }}
+            - Commit: `${{ github.sha }}`
+            - 内核版本: ${{ env.KERNEL_VERSION }}
+            - defconfig: `${{ env.DEFCONFIG_RESOLVED }}`
+            - 工具链: AOSP clang（见运行日志）
+            - 说明: 仅替换 boot 分区内核；dtbo/dtb 来自原厂，未改动。
+          files: |
+            ${{ env.ZIP_NAME }}
+            artifacts/Image*
+            artifacts/vmlinux
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
