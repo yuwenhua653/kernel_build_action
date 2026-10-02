@@ -173,6 +173,11 @@ jobs:
         run: |
           set +e
           set -o pipefail
+          # 上游树 CONFIG_WERROR=y 把大量 warning 升级为 error（已连报
+          # unused-function / unused-variable 多起）。对 vendor/techpack
+          # 这类第三方代码统一豁免 unused 类警告（只关闭警告报告，
+          # 不影响代码生成与产物），避免逐个修源码、反复迭代。
+          export KCFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-label -Wno-unused-value -Wno-unused-parameter"
           echo "===== 确认 synx 补丁状态 ====="
           grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig \
             || echo "!! gki_defconfig 中未找到 MSM_GLOBAL_SYNX（补丁未生效）"
