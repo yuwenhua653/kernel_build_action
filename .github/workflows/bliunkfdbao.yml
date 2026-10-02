@@ -150,24 +150,27 @@ jobs:
       # 6. 编译内核（GKI + vendor 混合构建）
       #    产物目录: out/android12-5.10/dist/ (boot.img, vendor_boot.img,
       #              dtbo.img, dtb.img, Image, vmlinux.symvers, 内核模块...)
-      #    失败时自动采集退出码/内存/磁盘/OOM 证据，便于定位
+      #    日志通过 tee 留存；失败时自动打印其中的关键错误行，
+      #    不再需要手动翻找（构建输出仍实时显示在日志里）
       # ------------------------------------------------------------
       - name: Build kernel
         run: |
           set +e
-          BUILD_CONFIG=common/build.config.msm.parrot LTO=thin build/build.sh
-          rc=$?
+          set -o pipefail
+          echo "===== 确认 synx 补丁状态 ====="
+          grep -n "MSM_GLOBAL_SYNX" common/arch/arm64/configs/gki_defconfig \
+            || echo "!! gki_defconfig 中未找到 MSM_GLOBAL_SYNX（补丁未生效）"
+          BUILD_CONFIG=common/build.config.msm.parrot LTO=thin build/build.sh 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             echo "===== build.sh 退出码: $rc ====="
+            echo "===== 日志中的关键错误行（真正的报错在这里）====="
+            grep -nE "error:|Error [0-9]+|No rule|undefined|incomplete|cannot|not found|Killed|No space|fatal" /tmp/build.log | tail -50
+            echo "===== 日志最后 30 行 ====="
+            tail -30 /tmp/build.log
             echo "===== 失败后内存/磁盘状态 ====="
             free -h
             df -h
-            echo "===== 内核日志中的 OOM / 磁盘错误证据 ====="
-            (sudo dmesg -T 2>/dev/null || journalctl -k -n 40 2>/dev/null) \
-              | tail -n 40 | grep -iE "killed process|out of memory|oom|no space|drm" || true
-            echo "===== 已编译产物规模（判断编译到哪一步）====="
-            find out -name '*.o' 2>/dev/null | wc -l
-            du -sh out 2>/dev/null || true
             exit "$rc"
           fi
           echo "===== 编译成功 ====="
