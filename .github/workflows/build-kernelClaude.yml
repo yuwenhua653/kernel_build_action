@@ -1,0 +1,216 @@
+name: Build Marble Kernel
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Upload as a release"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      anykernel:
+        description: "Package with AnyKernel3"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  # ── Toolchain ──────────────────────────────────────────────────────────
+  # Neutron Clang (latest); swap URL/path if you prefer another toolchain.
+  CLANG_REPO: "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+  CLANG_DIR: ${{ github.workspace }}/toolchain/neutron-clang
+
+  # ── Kernel config ──────────────────────────────────────────────────────
+  DEFCONFIG: vendor/marble_defconfig
+  ARCH: arm64
+
+  # ── AnyKernel3 ─────────────────────────────────────────────────────────
+  ANYKERNEL_REPO: "https://github.com/osm0sis/AnyKernel3"
+  ANYKERNEL_BRANCH: "master"
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ── 1. Checkout source ─────────────────────────────────────────────
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. System dependencies ─────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache \
+            curl flex gcc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            git gnupg gperf libelf-dev libncurses5-dev libssl-dev \
+            lz4 lzop python3 rsync schedtool zip zlib1g-dev
+
+      # ── 3. ccache ──────────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 2G
+          key: kernel-marble-${{ github.sha }}
+          restore-keys: kernel-marble-
+
+      # ── 4. Toolchain ───────────────────────────────────────────────────
+      - name: Download Neutron Clang
+        run: |
+          mkdir -p "${CLANG_DIR}"
+          curl -fsSL "${CLANG_REPO}" -o "${CLANG_DIR}/antman"
+          chmod +x "${CLANG_DIR}/antman"
+          cd "${CLANG_DIR}"
+          ./antman -S=latest
+          echo "Clang version: $(${CLANG_DIR}/bin/clang --version | head -1)"
+
+      # ── 5. Build ───────────────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          export PATH="${CLANG_DIR}/bin:${PATH}"
+          export CCACHE_EXEC=$(which ccache)
+          export USE_CCACHE=1
+
+          MAKE_FLAGS=(
+            -j"$(nproc --all)"
+            O=out
+            ARCH="${ARCH}"
+            CC="ccache clang"
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            STRIP=llvm-strip
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            HOSTCC="ccache clang"
+            HOSTCXX="ccache clang++"
+            HOSTAR=llvm-ar
+            HOSTLD=ld.lld
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          echo "::group::defconfig"
+          make "${MAKE_FLAGS[@]}" "${DEFCONFIG}"
+          echo "::endgroup::"
+
+          echo "::group::kernel image"
+          make "${MAKE_FLAGS[@]}"
+          echo "::endgroup::"
+
+      # ── 6. Verify output ───────────────────────────────────────────────
+      - name: Locate kernel image
+        id: image
+        run: |
+          for img in \
+            out/arch/arm64/boot/Image \
+            out/arch/arm64/boot/Image.gz \
+            out/arch/arm64/boot/Image-dtb \
+            out/arch/arm64/boot/Image.gz-dtb; do
+            if [ -f "${img}" ]; then
+              echo "path=${img}" >> "${GITHUB_OUTPUT}"
+              echo "name=$(basename ${img})" >> "${GITHUB_OUTPUT}"
+              echo "Found: ${img}"
+              break
+            fi
+          done
+          if [ -z "${{ steps.image.outputs.path }}" ]; then
+            echo "::error::Kernel image not found under out/arch/arm64/boot/"
+            exit 1
+          fi
+
+      # ── 7. DTB/DTBO (optional, best-effort) ───────────────────────────
+      - name: Collect DTBs
+        run: |
+          if find out/arch/arm64/boot/dts -name "*.dtb" -o -name "dtbo.img" \
+               2>/dev/null | grep -q .; then
+            mkdir -p artifacts/dtbs
+            find out/arch/arm64/boot/dts -name "*.dtb" \
+              -exec cp {} artifacts/dtbs/ \; 2>/dev/null || true
+            [ -f out/arch/arm64/boot/dtbo.img ] && \
+              cp out/arch/arm64/boot/dtbo.img artifacts/ || true
+          fi
+
+      # ── 8. AnyKernel3 packaging ───────────────────────────────────────
+      - name: Package with AnyKernel3
+        if: ${{ github.event.inputs.anykernel != 'false' }}
+        run: |
+          git clone --depth=1 \
+            "${ANYKERNEL_REPO}" \
+            -b "${ANYKERNEL_BRANCH}" \
+            AnyKernel3
+
+          cp "${{ steps.image.outputs.path }}" AnyKernel3/
+          [ -f artifacts/dtbs/*.dtb ] && \
+            cp artifacts/dtbs/*.dtb AnyKernel3/dtbs/ 2>/dev/null || true
+          [ -f artifacts/dtbo.img ] && \
+            cp artifacts/dtbo.img AnyKernel3/ || true
+
+          cd AnyKernel3
+          ZIP_NAME="Kernel-marble-$(date +%Y%m%d-%H%M)-${{ github.sha::7 }}.zip"
+          zip -r9 "../${ZIP_NAME}" . \
+            --exclude=".git*" --exclude="*.md"
+          echo "ZIP_NAME=${ZIP_NAME}" >> "${GITHUB_ENV}"
+          echo "Packaged: ${ZIP_NAME}"
+
+      # ── 9. Upload artifacts ───────────────────────────────────────────
+      - name: Upload kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-${{ github.sha }}
+          path: ${{ steps.image.outputs.path }}
+          retention-days: 7
+
+      - name: Upload AnyKernel3 zip
+        if: ${{ github.event.inputs.anykernel != 'false' && env.ZIP_NAME != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3-${{ github.sha }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      - name: Upload DTBs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbs-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── 10. Release (manual trigger only) ────────────────────────────
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.release == 'true' && env.ZIP_NAME != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "kernel-${{ github.run_number }}"
+          name: "Marble Kernel — build ${{ github.run_number }}"
+          body: |
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Toolchain:** Neutron Clang (latest)
+            **Defconfig:** ${{ env.DEFCONFIG }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ steps.image.outputs.path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
