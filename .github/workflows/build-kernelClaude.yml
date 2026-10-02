@@ -148,7 +148,7 @@ jobs:
           [ -f artifacts/dtbo.img ] && \
             cp artifacts/dtbo.img AnyKernel3/ || true
           cd AnyKernel3
-          ZIP_NAME="Kernel-marble-$(date +%Y%m%d-%H%M)-${{ github.sha::7 }}.zip"
+          ZIP_NAME="Kernel-marble-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}.zip"
           zip -r9 "../${ZIP_NAME}" . \
             --exclude=".git*" --exclude="*.md"
           echo "ZIP_NAME=${ZIP_NAME}" >> "${GITHUB_ENV}"
