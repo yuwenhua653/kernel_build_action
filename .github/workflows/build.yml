@@ -1,30 +1,288 @@
-# A simple action usage
-name: Build Kernel
+# ============================================================
+# Melt Kernel - Android Kernel for Redmi Note 12 Turbo (marble) / Poco F5 (marblein)
+# GitHub Actions 自动编译工作流
+#
+# 使用方法:
+# 1. 将此文件保存为 .github/workflows/build.yml
+# 2. 推送到 GitHub 仓库即可自动触发编译
+# 3. 也可通过 Actions tab 手动触发
+# ============================================================
+
+name: Build Melt Kernel (marble)
+
 on:
+  push:
+    branches: [melt-rebase]
+  pull_request:
+    branches: [melt-rebase]
   workflow_dispatch:
 
+env:
+  KERNEL_DEFCONFIG: marble_defconfig
+  KERNEL_ARCH: arm64
+  BUILD_OUT: out
+
 jobs:
-  Build-Kernel:
-    strategy:
-      fail-fast: false
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  # ============================================================
+  # Job 1: 使用 GCC 交叉编译工具链编译
+  # ============================================================
+  build-gcc:
+    name: Build (GCC Toolchain)
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Build Kernel
-        uses: dabao1955/kernel_build_action@main
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
         with:
-          kernel-url: https://github.com/AcmeUI-Devices/android_kernel_xiaomi_cas
-          kernel-dir: msm-4.19
-          kernel-branch: taffy
-          config: cas_defconfig
-          arch: arm64
-          aosp-gcc: true
-          aosp-clang: true
-          ksu: true
-          ksu-version: main
-          android-version: 12
-          aosp-clang-version: r383902
-          disable-lto: true
-          anykernel3: true
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3 \
+            python3-pip \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            make \
+            libc6-dev \
+            libncurses5-dev \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            cpio \
+            rsync \
+            unzip \
+            git \
+            wget
+
+      - name: Configure kernel (marble_defconfig)
+        run: |
+          echo "Configuring kernel with ${{ env.KERNEL_DEFCONFIG }}..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            O=${{ env.BUILD_OUT }} \
+            ${{ env.KERNEL_DEFCONFIG }}
+
+      - name: Build kernel
+        run: |
+          echo "Building kernel..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            O=${{ env.BUILD_OUT }} \
+            -j$(nproc --all)
+
+      - name: Build kernel images (Image.gz, Image.gz-dtb)
+        run: |
+          echo "Building kernel images..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            O=${{ env.BUILD_OUT }} \
+            -j$(nproc --all) \
+            Image.gz Image.gz-dtb
+
+      - name: Check build output
+        run: |
+          echo "=== Build Output ==="
+          find ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/ -type f -name "*.img" -o -name "Image*" -o -name "*.dtb" 2>/dev/null | head -20
+          echo "=== Kernel Size ==="
+          for f in ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image* ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/*.dtb 2>/dev/null; do
+            if [ -f "$f" ]; then
+              du -h "$f"
+            fi
+          done
+
+      - name: Upload kernel Image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-gcc-Image
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload compressed Image.gz
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-gcc-Image-gz
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Image.gz-dtb
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-gcc-Image-gz-dtb
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload DTB files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-gcc-dtbs
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/dts/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload full build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-gcc-full-build
+          path: ${{ env.BUILD_OUT }}/
+          retention-days: 7
+
+  # ============================================================
+  # Job 2: 使用 LLVM/Clang 工具链编译 (推荐用于现代内核)
+  # ============================================================
+  build-clang:
+    name: Build (LLVM/Clang Toolchain)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3 \
+            python3-pip \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            make \
+            libc6-dev \
+            libncurses5-dev \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            cpio \
+            rsync \
+            unzip \
+            git \
+            wget \
+            curl \
+            clang \
+            lld \
+            llvm
+
+      - name: Verify Clang version
+        run: |
+          clang --version
+          echo "Clang is ready for kernel compilation"
+
+      - name: Configure kernel with LLVM (marble_defconfig)
+        run: |
+          echo "Configuring kernel with LLVM/Clang..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=${{ env.BUILD_OUT }} \
+            ${{ env.KERNEL_DEFCONFIG }}
+
+      - name: Build kernel with LLVM
+        run: |
+          echo "Building kernel with LLVM/Clang..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=${{ env.BUILD_OUT }} \
+            -j$(nproc --all)
+
+      - name: Build kernel images (Image.gz, Image.gz-dtb)
+        run: |
+          echo "Building kernel images with LLVM..."
+          make \
+            ARCH=${{ env.KERNEL_ARCH }} \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=${{ env.BUILD_OUT }} \
+            -j$(nproc --all) \
+            Image.gz Image.gz-dtb
+
+      - name: Check build output
+        run: |
+          echo "=== Build Output ==="
+          find ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/ -type f -name "*.img" -o -name "Image*" -o -name "*.dtb" 2>/dev/null | head -20
+          echo "=== Kernel Size ==="
+          for f in ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image* ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/*.dtb 2>/dev/null; do
+            if [ -f "$f" ]; then
+              du -h "$f"
+            fi
+          done
+
+      - name: Upload kernel Image (Clang)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-clang-Image
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload compressed Image.gz (Clang)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-clang-Image-gz
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Image.gz-dtb (Clang)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-clang-Image-gz-dtb
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload DTB files (Clang)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-clang-dtbs
+          path: ${{ env.BUILD_OUT }}/arch/${{ env.KERNEL_ARCH }}/boot/dts/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload full build output (Clang)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-marble-clang-full-build
+          path: ${{ env.BUILD_OUT }}/
+          retention-days: 7
