@@ -1,0 +1,96 @@
+# oss-kernel-build.yml — SM8850 OSS 内核 GitHub Actions 云端编译
+#
+# 用法:
+#   1) 把 sm8850-oss-kit 推送到你的 GitHub 仓库（或 fork 后放入）
+#   2) 仓库页面 → Actions → "SM8850 OSS Kernel Build" → Run workflow
+#   3) 选择来源/分支 → 运行 → 下载产物 artifact（prebuilt/oss: Image/dtb/modules）
+#   4) 把产物拷贝到 ROM kernel 树，按 docs/04 切换 BoardConfig 后刷机
+#
+# 说明:
+#   * 免费 runner 为 ubuntu-24.04（4 核 16GB），编译大内核约 30~90 分钟，
+#     超时可改用付费 runner 或自托管 runner。
+#   * source=micode 时需在 branch 填官方实际发布分支（如 nezha-x-oss，发布前会预检失败）；
+#   * source=generic 时需填 kernel_url；
+#   * vendor_config 为相对内核树的 vendor 增量配置路径（可选，02 脚本自动探测时留空）。
+#
+# 本地等价运行: bash scripts/08-github-oss-build.sh -s oneplus
+
+name: SM8850 OSS Kernel Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 内核源码来源
+        type: choice
+        options:
+          - oneplus
+          - nubia
+          - micode
+          - generic
+          - gki
+        default: oneplus
+      branch:
+        description: 内核分支（oneplus 默认 oneplus/sm8850；micode 需填官方实际分支）
+        type: string
+        default: oneplus/sm8850
+      kernel_url:
+        description: 仅 source=generic 需要：仓库 URL
+        type: string
+        default: ""
+      vendor_config:
+        description: vendor 增量配置（相对内核树路径，可选；留空则 02 自动探测）
+        type: string
+        default: ""
+      gki_branch:
+        description: GKI 基线分支（source=gki 时使用）
+        type: string
+        default: android17-6.18
+
+jobs:
+  build:
+    name: Build OSS Kernel (SM8850)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: 检出套件
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git make flex bison bc cpio \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler lz4 lzop xz-utils zstd \
+            erofs-utils
+          git --version
+
+      - name: 安装 clang（GKI 强制 LLVM 工具链）
+        run: |
+          sudo apt-get install -y -qq clang lld llvm
+          clang --version
+
+      - name: 拉取 + 编译 + 打包 + 自检（08 一键编排）
+        id: ossbuild
+        run: |
+          set -euo pipefail
+          ARGS="-s ${{ github.event.inputs.source }} -b '${{ github.event.inputs.branch }}'"
+          ARGS="$ARGS -o out/oss -k prebuilt/oss"
+          ARGS="$ARGS -g ${{ github.event.inputs.gki_branch }}"
+          if [ -n "${{ github.event.inputs.kernel_url }}" ]; then
+            ARGS="$ARGS -u ${{ github.event.inputs.kernel_url }}"
+          fi
+          if [ -n "${{ github.event.inputs.vendor_config }}" ]; then
+            ARGS="$ARGS -c ${{ github.event.inputs.vendor_config }}"
+          fi
+          echo "运行: bash scripts/08-github-oss-build.sh $ARGS"
+          bash scripts/08-github-oss-build.sh $ARGS
+
+      - name: 上传内核产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm8850-oss-kernel
+          path: prebuilt/oss/
+          if-no-files-found: error
+          retention-days: 30
