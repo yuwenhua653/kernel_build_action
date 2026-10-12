@@ -141,39 +141,45 @@ jobs:
           repo --version || true
           df -h "$WORK"; free -h
 
-      - name: ② repo init（含 kernel-platform 组）+ 注入 qcom 三树 local_manifest
+      - name: ② repo init（含 kernel-platform 组）+ local_manifest 引入内核平台与 qcom 三树
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           mkdir -p "$WORK/src"; cd "$WORK/src"
-          # 关键：-g 必须包含 kernel-platform 组，否则 Kleaf/common/prebuilts 不会被同步
+          # -g 必须含 kernel-platform 组（snippet 内工程都带该组）
           repo init -u "$LOS_MANIFEST" -b "$LOS_BRANCH" \
             -g default,kernel-platform,kernel-platform-612 --no-clone-bundle
           mkdir -p .repo/local_manifests
+          # 两个实测坑：① local_manifest 的 <include> 相对 .repo/ 解析，必须带 manifests/ 前缀；
+          # ② qcom 三树要显式归入 kernel-platform 组，否则被 -g 过滤（repo 还会自动追加 local:: 组）。
           cat > .repo/local_manifests/kernel-sm8850.xml <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <manifest>
-            <include name="$KERNEL_SNIPPET" />
-            <project path="$PLATFORM_DIR/vendor/qcom/sm8850" name="$QCOM_KERNEL" revision="$REPO_BRANCH" />
-            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-modules" name="$QCOM_MODULES" revision="$REPO_BRANCH" />
-            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-devicetrees" name="$QCOM_DT" revision="$REPO_BRANCH" />
+            <include name="manifests/$KERNEL_SNIPPET" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850" name="$QCOM_KERNEL" revision="$REPO_BRANCH" groups="kernel-platform,kernel-platform-612" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-modules" name="$QCOM_MODULES" revision="$REPO_BRANCH" groups="kernel-platform,kernel-platform-612" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-devicetrees" name="$QCOM_DT" revision="$REPO_BRANCH" groups="kernel-platform,kernel-platform-612" />
           </manifest>
           EOF
           echo "=== local_manifest ==="; cat .repo/local_manifests/kernel-sm8850.xml
-          echo "=== 合并后内核平台项目数（应为数十个，含 build/kernel、common、prebuilts）==="
-          repo list 2>/dev/null | grep -c "$PLATFORM_DIR" || true
-          echo "=== 关键项目是否进入清单 ==="
-          repo list 2>/dev/null | grep -E "build/kernel$|/$PLATFORM_DIR/common$|clang/host/linux-x86|vendor/qcom/sm8850$" || \
-            { echo "✗ 关键平台项目未进入 repo list，group/include 未生效"; exit 1; }
+          # sync 之前 repo list 必为空（它依赖 sync 生成的 .repo/project.list），校验必须用 repo manifest 解析合并清单
+          repo manifest > /tmp/merged.xml 2>/tmp/merged.err || { echo "✗ manifest 解析失败:"; cat /tmp/merged.err; exit 1; }
+          echo "=== 合并清单内内核平台项目数（应为 53 = 平台50 + qcom三树3）==="
+          grep -oE "path=\"$PLATFORM_DIR/[^\"]*\"" /tmp/merged.xml | sort -u | wc -l
+          echo "=== 关键项目是否进入合并清单 ==="
+          grep -E "path=\"[^\"]*build/kernel\"|path=\"[^\"]*$PLATFORM_DIR/common\"|clang/host/linux-x86|vendor/qcom/sm8850\"" /tmp/merged.xml \
+            || { echo "✗ 关键平台项目未进入合并清单，include/group 未生效："; cat /tmp/merged.err; exit 1; }
 
       - name: ③ repo sync 内核平台子树 + qcom 三树（自动重试）
         run: |
           set -uo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           cd "$WORK/src"
-          mapfile -t KP < <(repo list 2>/dev/null | sed 's/ :.*//' | grep "^$PLATFORM_DIR/" || true)
+          # 同步子集同样从 repo manifest 取 path（不能用 sync 前为空的 repo list）
+          mapfile -t KP < <(repo manifest 2>/dev/null | grep -oE "path=\"$PLATFORM_DIR/[^\"]*\"" | sed 's/path="//;s/"//' | sort -u)
           echo "待同步项目数: ${#KP[@]}"
-          echo "${KP[@]}" | tr ' ' '\n' | grep -E "build/kernel|/common|prebuilts/clang|external/|vendor/qcom" | head -30
+          [ "${#KP[@]}" -ge 50 ] || { echo "✗ 同步子集项目数异常(${#KP[@]})，中止"; repo manifest 2>&1 | tail -20; exit 1; }
+          printf '%s\n' "${KP[@]}" | grep -E "build/kernel$|/common$|prebuilts/clang|external/|vendor/qcom" | head -30
           n=0
           until [ "$n" -ge 6 ]; do
             n=$((n+1)); echo "===== repo sync 第 $n 次 ====="
