@@ -1,0 +1,409 @@
+# nezha-fulloss-boot.yml — 小米17 Ultra(nezha) SM8850【全开源 · 能开机】一键包（单文件，两个 job）
+#
+# 目标：内核与高通平台模块 100% 用 LineageOS 高通工程开源自编、不锁 KMI、不含任何小米预编 .ko，
+#       并组装成一个 fastboot 能刷、尽量能正常开机进系统的包。
+#
+# 能开机的关键取舍（务必理解）：
+#   · boot.img        = LOS 编的 6.12 Image，按【官方 boot 头参数/cmdline】重打          —— 开源自编
+#   · vendor_dlkm.img = LOS dist 的【全开源高通模块】镜像（canoe_dist 已含 in-tree + techpack 外部模块：
+#                       wlan/camera/display/securemsm/touch/audio…，无小米 .ko）          —— 开源自编
+#   · vendor_boot / init_boot / dtbo = 【官方原样，不改动】
+#       → 板级 DTB/DTBO（屏幕/触控/指纹/PMIC 的具体硬件描述）在 vendor_boot+dtbo 里。
+#         小米没有开源 nezha 的 DTS，自己造的通用 canoe DTB 点不亮屏；DTB 是“硬件描述数据”，
+#         不是内核代码、不受 KMI 约束，沿用官方 DTB + 全开源内核是社区移植标准点亮手法。
+#   · vbmeta          = 重新生成【关闭 verity/校验】，否则自定义分区过不了 AVB 无法开机
+#   · 固件(modem/GPU/DSP)、用户空间 HAL、其余分区全部官方保留
+#
+# 全开源后【会失效】的功能（小米没给开源 .ko，无源码可编）：
+#   屏下指纹算法、相机厂商算法/调校、小米私有快充协议、部分传感器/智能背光、性能调度私有策略等。
+#   report.txt 列出“官方有、开源缺失”的确切 .ko 清单，并自检官方 modules.load 是否缺开机关键模块。
+#   电话/短信/移动网络/WiFi/蓝牙/显示/触摸/音频/存储等高通开源链路预期可用。不开机可 restore_stock.sh 回退。
+#
+# 已实测并处理的构建坑（与 canoe-los.yml 一致）：
+#   · kernel-6.12.xml 平台工程带 groups="kernel-platform-612"，必须 repo init -g 显式纳入，否则 Kleaf/common 被跳过；
+#   · tools/bazel 是 build/kernel/kleaf/bazel.sh 的 linkfile（bzlmod 自管 bazel 版本），优先用它。
+#   · LineageOS 设备量产目标 TARGET_KERNEL_PLATFORM_TARGET=canoe_perf，故默认 variant=perf。
+#
+# 两个 job（artifact 自动传递，点一次 Run）：
+#   build : repo 还原 LOS kernel-6.12 平台 + qcom 三树，bazel 编 canoe_<variant>_dist，上传 Image/vendor_dlkm
+#   pack  : 下载官方 OTA 提取板级分区 → 用 LOS Image 重打 boot → 组全开源 vendor_dlkm/禁用vbmeta/刷机回退脚本/报告
+#
+# ★ 手机部署：Add file → Create new file → .github/workflows/nezha-fulloss-boot.yml → 粘贴 → Commit
+#   → Actions → “nezha 全开源能开机包(LOS)” → Run workflow → build+pack 合计约 2~4 小时 → 下载 nezha-fulloss zip。
+
+name: nezha 全开源能开机包(LOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ota_url:
+        description: 官方完整 OTA 直链（取板级 DTB/ramdisk/回退件）
+        type: string
+        default: "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS4.0.0.28.XPACNXM/nezha-ota_full-OS4.0.0.28.XPACNXM-user-17.0-b3f8cb1894.zip"
+      los_manifest:
+        description: LineageOS manifest
+        type: string
+        default: "https://github.com/LineageOS/android"
+      los_branch:
+        description: LineageOS 分支
+        type: string
+        default: "lineage-24.0"
+      kernel_snippet:
+        description: 内核平台 snippet
+        type: string
+        default: "snippets/kernel-6.12.xml"
+      platform_dir:
+        description: Kleaf 工作区根
+        type: string
+        default: "kernel/platform/kernel-6.12"
+      target:
+        description: 平台目标
+        type: string
+        default: "canoe"
+      variant:
+        description: 变体（LineageOS 量产用 perf）
+        type: choice
+        options: [perf, consolidate]
+        default: perf
+      bazel_jobs:
+        description: bazel 并发（内存/磁盘紧可调小）
+        type: string
+        default: "4"
+      sync_jobs:
+        description: repo sync 并发
+        type: string
+        default: "8"
+      include_system_dlkm:
+        description: 同时刷全开源 system_dlkm（一般保持）
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: ① 编 LOS 全开源内核与 vendor_dlkm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+    env:
+      WORK: ${{ runner.workspace }}/los
+      LOS_MANIFEST: ${{ github.event.inputs.los_manifest }}
+      LOS_BRANCH: ${{ github.event.inputs.los_branch }}
+      KERNEL_SNIPPET: ${{ github.event.inputs.kernel_snippet }}
+      PLATFORM_DIR: ${{ github.event.inputs.platform_dir }}
+      TARGET: ${{ github.event.inputs.target }}
+      VARIANT: ${{ github.event.inputs.variant }}
+      BAZEL_JOBS: ${{ github.event.inputs.bazel_jobs }}
+      SYNC_JOBS: ${{ github.event.inputs.sync_jobs }}
+    steps:
+      - name: 准备：清盘 / swap / repo
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/microsoft/msedge* /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/lib/firefox* /usr/lib/thunderbird* 2>/dev/null || true
+          sudo apt-get clean || true
+          mkdir -p "$WORK"; sudo fallocate -l 16G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
+          sudo chmod 600 /swapfile; sudo mkswap -q /swapfile; sudo swapon /swapfile
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl python3 repo zstd tar xz-utils file zip unzip rsync >/dev/null 2>&1 || \
+            sudo apt-get install -y -qq git curl python3 zstd tar xz-utils file zip unzip rsync
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo" && chmod a+rx "$HOME/.local/bin/repo" || true
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          git config --global user.name b; git config --global user.email b@l
+          df -h "$WORK"; free -h
+
+      - name: repo init（含 kernel-platform 组）+ 注入 qcom 三树
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$WORK/src"; cd "$WORK/src"
+          repo init -u "$LOS_MANIFEST" -b "$LOS_BRANCH" \
+            -g default,kernel-platform,kernel-platform-612 --no-clone-bundle
+          mkdir -p .repo/local_manifests
+          cat > .repo/local_manifests/kernel-sm8850.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <include name="$KERNEL_SNIPPET" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850" name="LineageOS/android_kernel_qcom_sm8850" revision="$LOS_BRANCH" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-modules" name="LineageOS/android_kernel_qcom_sm8850-modules" revision="$LOS_BRANCH" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-devicetrees" name="LineageOS/android_kernel_qcom_sm8850-devicetrees" revision="$LOS_BRANCH" />
+          </manifest>
+          EOF
+          echo "平台项目数: $(repo list 2>/dev/null | grep -c "$PLATFORM_DIR")"
+          repo list 2>/dev/null | grep -E "build/kernel$|/$PLATFORM_DIR/common$|clang/host/linux-x86|vendor/qcom/sm8850$" \
+            || { echo "✗ 关键平台项目未进入 repo list，group/include 未生效"; exit 1; }
+
+      - name: repo sync 仅内核平台子树（重试）
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$WORK/src"
+          mapfile -t KP < <(repo list 2>/dev/null | sed 's/ :.*//' | grep "^$PLATFORM_DIR/" || true)
+          echo "待同步项目数: ${#KP[@]}"
+          n=0
+          until [ "$n" -ge 6 ]; do
+            n=$((n+1)); echo "===== sync 第 $n 次 ====="
+            if repo sync -c --no-tags --prune --no-clone-bundle -j"$SYNC_JOBS" --fail-fast "${KP[@]}"; then echo OK; break; fi
+            sleep 10; repo sync -c --no-tags --prune --no-clone-bundle -j2 "${KP[@]}" || true
+          done
+          ls -l "$WORK/src/$PLATFORM_DIR/tools/bazel" 2>/dev/null || echo "(tools/bazel linkfile 缺失)"
+
+      - name: 同步结果强校验
+        run: |
+          set -uo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"; miss=0
+          chk() { [ -e "$1" ] && echo "  OK  $1" || { echo "  ✗ 缺 $1"; miss=1; }; }
+          grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" common/Makefile 2>/dev/null | head -3
+          chk common/Makefile; chk build/kernel/kleaf/kleaf.bzl; chk build/kernel/kleaf/bazel.sh
+          chk WORKSPACE.bzlmod; chk prebuilts/clang/host/linux-x86
+          chk vendor/qcom/sm8850/BUILD.bazel
+          chk vendor/qcom/sm8850-modules/qcom/opensource/camera-kernel/BUILD.bazel
+          [ "$miss" -eq 0 ] || { echo "✗ 平台不完整（group/sync 未生效），请把本步日志发回"; exit 1; }
+          if [ -x tools/bazel ]; then echo "tools/bazel" > "$WORK/.bazelpath"
+          elif [ -x build/kernel/kleaf/bazel.sh ]; then echo "build/kernel/kleaf/bazel.sh" > "$WORK/.bazelpath"
+          else echo "bazel 缺失"; exit 1; fi
+          BAZEL=$(cat "$WORK/.bazelpath"); "$BAZEL" --version || true
+
+      - name: bazel 构建 canoe dist
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          BAZEL=$(cat "$WORK/.bazelpath"); mkdir -p "$WORK/bazelcache"
+          T="//vendor/qcom/sm8850:${TARGET}_${VARIANT}_dist"
+          echo "build $T"
+          set +e
+          "$BAZEL" --output_user_root="$WORK/bazelcache" build "$T" --jobs="$BAZEL_JOBS" --keep_going 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            "$BAZEL" query "//vendor/qcom/sm8850:all" 2>/dev/null | grep -iE "${TARGET}.*_dist$" | tee -a build.log || true
+          fi
+          exit $rc
+
+      - name: 收集全开源镜像（Image / vendor_dlkm / system_dlkm）
+        if: always()
+        run: |
+          set -uo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          OUT="$WORK/dist"; mkdir -p "$OUT"
+          D=$(find bazel-bin -type d -name "${TARGET}_${VARIANT}_dist" 2>/dev/null | head -1)
+          echo "dist 目录: $D"; ls -la "$D" 2>/dev/null | head -80
+          [ -f "$D/Image" ] && cp "$D/Image" "$OUT/Image"
+          find "$D" -maxdepth 2 -type f \( -name 'vendor_dlkm.img' -o -name 'system_dlkm.img' \) 2>/dev/null | while read -r f; do cp -v "$f" "$OUT/"; done
+          find "$D" -maxdepth 3 -name 'modules.load*' 2>/dev/null | head -5 | while read -r f; do b=$(echo "$f" | sed 's#.*/##'); cp -v "$f" "$OUT/$b" 2>/dev/null || true; done
+          {
+            echo "LOS canoe build: $(date -u)"
+            echo "target=$TARGET variant=$VARIANT branch=$LOS_BRANCH"
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' common/Makefile 2>/dev/null | head -3
+            echo "Image: $(file "$OUT/Image" 2>/dev/null)"
+            strings "$OUT/Image" 2>/dev/null | grep -m1 'Linux version' || true
+            echo "dist images:"; ls -la "$OUT"
+          } | tee "$OUT/build_info.txt"
+          du -sh "$OUT" || true
+
+      - name: 上传 canoe-dist 供 pack 使用
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canoe-dist
+          path: ${{ runner.workspace }}/los/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  pack:
+    name: ② 提取官方板级件 + 组全开源能开机包
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      WORK: ${{ runner.workspace }}/pack
+      OTA_URL: ${{ github.event.inputs.ota_url }}
+      TARGET: ${{ github.event.inputs.target }}
+      VARIANT: ${{ github.event.inputs.variant }}
+      INC_SYS: ${{ github.event.inputs.include_system_dlkm }}
+    steps:
+      - name: 下载 canoe-dist
+        uses: actions/download-artifact@v4
+        with:
+          name: canoe-dist
+          path: ${{ runner.workspace }}/pack/dist
+
+      - name: 准备：工具 / payload-dumper / mkbootimg / avbtool
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/microsoft/msedge* 2>/dev/null || true
+          sudo apt-get clean || true
+          mkdir -p "$WORK"; cd "$WORK"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl python3 kmod file libssl-dev libelf-dev \
+            lz4 xz-utils zstd erofs-utils p7zip-full e2fsprogs cpio zip unzip 2>/dev/null || \
+            sudo apt-get install -y -qq git curl python3 kmod file libssl-dev libelf-dev lz4 xz-utils zstd erofs-utils p7zip-full e2fsprogs cpio zip unzip
+          API=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/ssut/payload-dumper-go/releases/latest)
+          PD_URL=$(printf '%s' "$API" | python3 -c "import sys,json;d=json.load(sys.stdin);print(next(a['browser_download_url'] for a in d['assets'] if 'linux' in a['name'].lower() and 'x86_64' in a['name'].lower()))")
+          curl -sL "$PD_URL" -o pd.tgz; mkdir -p pd && tar xzf pd.tgz -C pd
+          find pd -name payload-dumper-go -type f | head -1 > .pd; chmod +x "$(cat .pd)"
+          git clone --depth=1 -q https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          git clone --depth=1 -q https://android.googlesource.com/platform/external/avb avb
+          ls -lh dist/; df -h "$WORK"
+
+      - name: 下载 OTA 并提取板级/回退分区
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          curl -L --fail --retry 5 --retry-delay 5 -C - --progress-bar -o ota.zip "$OTA_URL"
+          mkdir -p zx parts
+          python3 - <<'PY'
+          import zipfile, shutil, os
+          z=zipfile.ZipFile(os.path.join(os.environ['WORK'],'ota.zip'))
+          c=[n for n in z.namelist() if n.endswith('payload.bin')]; assert c
+          with z.open(c[0]) as s, open(os.path.join(os.environ['WORK'],'zx','payload.bin'),'wb') as d:
+              shutil.copyfileobj(s,d,length=16*1024*1024)
+          print("payload ok")
+          PY
+          rm -f ota.zip
+          PD=$(cat .pd)
+          "$PD" -l zx/payload.bin | tee parts_list.txt || true
+          WANT="boot init_boot vendor_boot dtbo vendor_dlkm system_dlkm vbmeta vbmeta_system vbmeta_vendor"
+          HAVE=""; for p in $WANT; do grep -qw "$p" parts_list.txt && HAVE="$HAVE,$p"; done
+          HAVE=${HAVE#,}; echo "提取: $HAVE"
+          "$PD" -o parts -p "$HAVE" zx/payload.bin
+          rm -rf zx; ls -lh parts/
+
+      - name: 解包官方与 LOS 的 vendor_dlkm，做模块差异（功能保留/失效）
+        run: |
+          set -uo pipefail
+          cd "$WORK"; mkdir -p stock_vd los_vd
+          unpack() { img="$1"; out="$2"; sudo mkdir -p /mnt/vm
+            if sudo mount -o loop,ro "$img" /mnt/vm 2>/dev/null; then sudo cp -a /mnt/vm/. "$out"/; sudo umount /mnt/vm
+            elif file "$img" | grep -qi erofs; then fsck.erofs --extract="$out" "$img" || 7z x -y -o"$out" "$img"
+            else 7z x -y -o"$out" "$img"; fi; }
+          unpack parts/vendor_dlkm.img stock_vd
+          [ -f dist/vendor_dlkm.img ] && unpack dist/vendor_dlkm.img los_vd || echo "LOS 未产出 vendor_dlkm.img（看 build 日志）"
+          find stock_vd -name '*.ko' -printf '%f\n' | sort -u > stock.txt
+          find los_vd   -name '*.ko' -printf '%f\n' | sort -u > los.txt
+          comm -12 stock.txt los.txt > cover.txt
+          comm -13 stock.txt los.txt > missing.txt
+          echo "官方 .ko=$(wc -l < stock.txt)  开源覆盖=$(wc -l < cover.txt)  缺失=$(wc -l < missing.txt)"
+          echo "── 缺失(对应功能失效) 前40 ──"; head -40 missing.txt
+
+      - name: 用 LOS Image 重打 boot.img（沿用官方 boot 头/cmdline）
+        run: |
+          set -euo pipefail
+          cd "$WORK"; mkdir -p bu
+          python3 mkbootimg/unpack_bootimg.py --boot_img parts/boot.img --out bu 2>&1 | tee bu.log
+          get() { grep -i "$1" bu.log | head -1 | sed 's/.*: *//'; }
+          HDR=$(get 'header version'); PGS=$(get 'page size'); CMD=$(get 'command line args')
+          OSV=$(get 'os version'); OSP=$(get 'os patch level')
+          KADDR=$(get 'kernel load address'); TADDR=$(get 'kernel tags load address')
+          echo "header=$HDR page=$PGS os=$OSV/$OSP"; echo "cmdline=$CMD"
+          ARGS=(--header_version "${HDR:-4}" --pagesize "${PGS:-4096}")
+          [ -n "$OSV" ] && ARGS+=(--os_version "$OSV")
+          [ -n "$OSP" ] && ARGS+=(--os_patch_level "$OSP")
+          [ -n "$CMD" ] && ARGS+=(--cmdline "$CMD")
+          if [ "${HDR:-4}" -ge 3 ]; then
+            ARGS+=(--base 0x00000000 --kernel_offset 0x00008000 --ramdisk_offset 0x01000000 --tags_offset 0x00000100)
+          else
+            BASE=$(printf '%d' "$(( KADDR - 0x00008000 ))" 2>/dev/null || echo 0)
+            ARGS+=(--base "$(printf '0x%08x' "$BASE")" --kernel_offset 0x00008000 \
+                   --tags_offset "$(printf '0x%08x' "$(( TADDR - BASE ))")")
+          fi
+          [ -s bu/ramdisk ] && ARGS+=(--ramdisk bu/ramdisk)
+          python3 mkbootimg/mkbootimg.py "${ARGS[@]}" --kernel dist/Image -o new_boot.img
+          ls -lh new_boot.img; file new_boot.img || true
+
+      - name: 生成禁用校验 vbmeta
+        run: |
+          set -euo pipefail
+          cd "$WORK"; mkdir -p avbout
+          # flags 3 = hashtree-disabled(1) | verification-disabled(2)
+          python3 avb/avbtool.py make_vbmeta_image --flags 3 --padding_size 4096 --output avbout/vbmeta.img
+          ls -lh avbout/vbmeta.img
+
+      - name: 组装全开源能开机包 + 刷机/回退脚本 + 报告
+        run: |
+          set -uo pipefail
+          cd "$WORK"; rm -rf pkg; mkdir -p pkg/stock
+          cp new_boot.img pkg/boot.img
+          [ -f dist/vendor_dlkm.img ] && cp dist/vendor_dlkm.img pkg/vendor_dlkm.img
+          if [ "$INC_SYS" = "true" ] && [ -f dist/system_dlkm.img ]; then cp dist/system_dlkm.img pkg/system_dlkm.img; fi
+          cp avbout/vbmeta.img pkg/vbmeta.img
+          for p in boot init_boot vendor_boot dtbo vendor_dlkm system_dlkm vbmeta vbmeta_system vbmeta_vendor; do
+            [ -f parts/$p.img ] && cp parts/$p.img pkg/stock/$p.img
+          done
+          cat > pkg/flash_fulloss.sh <<'SH'
+          #!/usr/bin/env bash
+          # 全开源能开机：刷开源 boot + 全开源 vendor_dlkm + 禁用AVB；vendor_boot/init_boot/dtbo 保持官方(板级DTB)
+          set -e
+          echo "== nezha 全开源(LineageOS) 刷入 =="
+          read -p "首次刷自定义内核建议清空 userdata，是否执行 fastboot -w ? [y/N] " w
+          fastboot flash boot boot.img
+          fastboot flash vendor_dlkm vendor_dlkm.img
+          [ -f system_dlkm.img ] && fastboot flash system_dlkm system_dlkm.img || true
+          fastboot flash vbmeta        --disable-verity --disable-verification vbmeta.img
+          fastboot flash vbmeta_system --disable-verity --disable-verification vbmeta.img 2>/dev/null || true
+          fastboot flash vbmeta_vendor --disable-verity --disable-verification vbmeta.img 2>/dev/null || true
+          [ "$w" = "y" ] && fastboot -w
+          fastboot reboot
+          SH
+          cat > pkg/restore_stock.sh <<'SH'
+          #!/usr/bin/env bash
+          # 一键回退官方：刷回官方 boot/vendor_dlkm/system_dlkm 与原始 vbmeta
+          set -e
+          fastboot flash boot stock/boot.img
+          fastboot flash vendor_dlkm stock/vendor_dlkm.img
+          [ -f stock/system_dlkm.img ] && fastboot flash system_dlkm stock/system_dlkm.img
+          fastboot flash vbmeta stock/vbmeta.img 2>/dev/null || true
+          fastboot flash vbmeta_system stock/vbmeta_system.img 2>/dev/null || true
+          fastboot flash vbmeta_vendor stock/vbmeta_vendor.img 2>/dev/null || true
+          fastboot reboot
+          SH
+          chmod +x pkg/*.sh
+          cat > pkg/README.txt <<'TXT'
+          小米17 Ultra(nezha) SM8850 全开源(LineageOS 高通工程)能开机包
+          ─────────────────────────────────────────────────────────
+          boot.img         开源自编 6.12 内核（LOS canoe，按官方头重打）
+          vendor_dlkm.img  全开源高通平台模块（无任何小米 .ko）
+          system_dlkm.img  全开源通用模块（可选刷入）
+          vbmeta.img       已关闭 verity/校验（自定义分区必需）
+          stock/           官方 boot/vendor_dlkm/vbmeta*/板级分区（回退用）
+          vendor_boot/init_boot/dtbo 不刷、保持官方：板级 DTB 在其中，是点亮屏幕/触摸的关键
+          flash_fulloss.sh  刷入全开源（手机进 fastboot，电脑执行；首次建议清数据）
+          restore_stock.sh  一键回退官方
+          report.txt        开源覆盖 / 失效功能模块清单 + 诊断
+
+          预期：显示/触摸/存储/USB/WiFi/蓝牙/移动网络/音频等高通开源链路可用；
+          屏下指纹算法/相机厂商算法/私有快充/部分传感器等小米专有功能失效（无源码）。
+          不开机/卡 logo/黑屏：fastboot 下执行 ./restore_stock.sh 回退，把 report.txt 与
+          开机串口/last kmsg 发回，按缺失的开机关键模块继续补。
+          TXT
+          {
+            echo "==== nezha 全开源能开机 报告 ===="
+            echo "时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "OTA : $OTA_URL"; echo "目标: $TARGET / $VARIANT"
+            echo; echo "## LOS 构建信息 ##"; cat dist/build_info.txt 2>/dev/null
+            echo; echo "## 模块对比 ##"
+            echo "官方 vendor_dlkm .ko 数 : $(wc -l < stock.txt)"
+            echo "开源已覆盖             : $(wc -l < cover.txt)"
+            echo "开源缺失(功能失效)     : $(wc -l < missing.txt)"
+            echo; echo "## 缺失模块清单（官方有、开源无）##"; cat missing.txt
+            echo; echo "## 开机关键模块自检（官方 modules.load 中是否缺失）##"
+            ML=$(find stock_vd -name 'modules.load' | head -1)
+            if [ -n "$ML" ]; then
+              awk '{print $NF}' "$ML" | xargs -n1 basename 2>/dev/null | sort -u > stock_load.txt
+              comm -13 los.txt stock_load.txt | sed 's/^/  缺: /' | head -60
+              echo "(若上面出现 clk/pinctrl/ufs/usb/display/rmnet 等早期模块，可能影响开机，需重点核对)"
+            else echo "未找到官方 modules.load"; fi
+          } | tee pkg/report.txt
+          cp missing.txt cover.txt pkg/ 2>/dev/null || true
+          echo "── 包内容 ──"; find pkg -type f -printf '%p  %s\n' | sort
+          (cd pkg && zip -rq ../nezha-fulloss.zip .)
+          mkdir -p "$GITHUB_WORKSPACE/out"; cp nezha-fulloss.zip "$GITHUB_WORKSPACE/out/"
+          ls -lh "$GITHUB_WORKSPACE/out/nezha-fulloss.zip"
+
+      - name: 上传全开源能开机包
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-fulloss
+          path: out/nezha-fulloss.zip
+          retention-days: 30
+          if-no-files-found: error
