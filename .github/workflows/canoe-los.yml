@@ -1,0 +1,284 @@
+# canoe-los.yml — SM8850(canoe)【基于 LineageOS 高通树】一键内核构建（单文件自包含）
+#
+# 你指定的底座：LineageOS 的高通 SM8850 树（不是小米骨架，也不是一加 manifest）。
+#
+# LineageOS 这套的真实拓扑（实测 lineage-24.0）：
+#   Kleaf 工作区根 = kernel/platform/kernel-6.12/
+#     ├─ common/                         内核本体 = AOSP GKI android16-6.12（canoe.bzl 里 kernel_build="//common:kernel_aarch64"）
+#     ├─ build/kernel/kleaf、prebuilts(clang/rust/gcc)、external(bazel规则)、tools/mkbootimg
+#     │                                ← snippets/kernel-6.12.xml 提供；tools/bazel、WORKSPACE.bzlmod、MODULE.bazel
+#     │                                  由 kernel/build 工程的 <linkfile> 生成（bzlmod 模式，bazel 版本由 bazel.sh 自管）
+#     └─ vendor/qcom/
+#         ├─ sm8850/                    = LineageOS/android_kernel_qcom_sm8850（soc 配置 + in-tree 平台驱动 + canoe target）
+#         ├─ sm8850-modules/            = LineageOS/android_kernel_qcom_sm8850-modules（camera/wlan/display/securemsm… 外部DDK模块）
+#         └─ sm8850-devicetrees/        = LineageOS/android_kernel_qcom_sm8850-devicetrees（qcom 设备树，canoe_dist 不依赖，可留）
+#
+#   canoe_<variant>_dist 已通过 techpack_modules.bzl 把 sm8850-modules 全部外部模块（//vendor/qcom/sm8850-modules/...）
+#   作为 bazel 跨包 deps 纳入，所以一次 bazel build 即产出含完整 vendor_dlkm 的 dist（无需另编模块仓库）。
+#
+# ★★ 两个已实测的易踩坑（本工作流已处理）：
+#   1) kernel-6.12.xml 里所有平台工程都带 groups="kernel-platform,kernel-platform-612"，
+#      普通 `repo sync`（只同步 default 组）会把 Kleaf/common/prebuilts 全部跳过 → 平台残缺、bazel 必失败。
+#      必须 `repo init -g default,kernel-platform,kernel-platform-612` 并显式同步平台路径。
+#   2) tools/bazel 是指向 build/kernel/kleaf/bazel.sh 的 linkfile；优先用它（bzlmod 自动选 bazel 版本），
+#      不要用通用 bazelisk 最新版（与 Kleaf 版本不匹配会报 API 错）。
+#
+# 产出：6.12 Image + vendor_dlkm(高通平台+techpack 模块) + system_dlkm + init_boot + dtbo（canoe 全套，开源可整体重编）。
+# 对接小米 nezha：板级 DTB 沿用官方 vendor_boot/dtbo、小米自研 .ko 无源码，见 docs/09 §5 与 nezha-fulloss-boot.yml。
+#
+# ★ 手机部署：Add file → Create new file → .github/workflows/canoe-los.yml → 粘贴 → Commit
+#   → Actions → “canoe LineageOS高通树构建” → Run workflow → 约120~240分钟 → 下载 artifact。
+
+name: canoe LineageOS高通树构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      los_manifest:
+        description: LineageOS manifest 仓库
+        type: string
+        default: "https://github.com/LineageOS/android"
+      los_branch:
+        description: LineageOS 分支
+        type: string
+        default: "lineage-24.0"
+      kernel_snippet:
+        description: 内核平台 snippet（common 6.12 + Kleaf + 工具链）
+        type: string
+        default: "snippets/kernel-6.12.xml"
+      platform_dir:
+        description: Kleaf 工作区根（repo 内路径）
+        type: string
+        default: "kernel/platform/kernel-6.12"
+      qcom_kernel_repo:
+        description: 高通 soc 内核树
+        type: string
+        default: "LineageOS/android_kernel_qcom_sm8850"
+      qcom_modules_repo:
+        description: 高通 vendor 模块树
+        type: string
+        default: "LineageOS/android_kernel_qcom_sm8850-modules"
+      qcom_dt_repo:
+        description: 高通设备树
+        type: string
+        default: "LineageOS/android_kernel_qcom_sm8850-devicetrees"
+      repo_branch:
+        description: 三棵 qcom 树的分支
+        type: string
+        default: "lineage-24.0"
+      target:
+        description: 平台目标
+        type: string
+        default: "canoe"
+      variant:
+        description: 变体（LineageOS 设备量产用 perf；consolidate 为全功能合并）
+        type: choice
+        options:
+          - perf
+          - consolidate
+        default: perf
+      bazel_jobs:
+        description: bazel 并发（runner 内存/磁盘紧可调小，如 2）
+        type: string
+        default: "4"
+      sync_jobs:
+        description: repo sync 并发
+        type: string
+        default: "8"
+
+jobs:
+  build:
+    name: 还原 LOS 内核平台 + 构建 canoe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    env:
+      WORK: /home/runner/los
+      LOS_MANIFEST: ${{ github.event.inputs.los_manifest }}
+      LOS_BRANCH: ${{ github.event.inputs.los_branch }}
+      KERNEL_SNIPPET: ${{ github.event.inputs.kernel_snippet }}
+      PLATFORM_DIR: ${{ github.event.inputs.platform_dir }}
+      QCOM_KERNEL: ${{ github.event.inputs.qcom_kernel_repo }}
+      QCOM_MODULES: ${{ github.event.inputs.qcom_modules_repo }}
+      QCOM_DT: ${{ github.event.inputs.qcom_dt_repo }}
+      REPO_BRANCH: ${{ github.event.inputs.repo_branch }}
+      TARGET: ${{ github.event.inputs.target }}
+      VARIANT: ${{ github.event.inputs.variant }}
+      BAZEL_JOBS: ${{ github.event.inputs.bazel_jobs }}
+      SYNC_JOBS: ${{ github.event.inputs.sync_jobs }}
+
+    steps:
+      - name: ① 准备：清盘 / 大盘 / swap / repo
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/microsoft/msedge* /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/lib/firefox* /usr/lib/thunderbird* 2>/dev/null || true
+          sudo apt-get clean || true
+          mkdir -p "$WORK"
+          # runner 自带 /swapfile 且正在使用，不能动它；用根盘独立路径，swap 失败也不中断。
+          # 编译放根盘 /home/runner（约70G），不放仅约14G的 /mnt 临时盘。
+          SWAP=/home/runner/swapfile
+          if ! sudo swapon --show 2>/dev/null | grep -q "$SWAP"; then
+            sudo rm -f "$SWAP"
+            sudo fallocate -l 12G "$SWAP" 2>/dev/null || sudo dd if=/dev/zero of="$SWAP" bs=1M count=12288 status=none 2>/dev/null || true
+            if [ -s "$SWAP" ]; then
+              sudo chmod 600 "$SWAP"; sudo mkswap -q "$SWAP" 2>/dev/null || true
+              sudo swapon "$SWAP" 2>/dev/null || echo "额外 swap 启用失败，沿用系统 swap 继续"
+            fi
+          fi
+          sudo swapon --show || true; free -h || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl python3 repo zstd tar xz-utils file kmod bc \
+            libssl-dev flex bison cpio zip unzip rsync >/dev/null 2>&1 || \
+            sudo apt-get install -y -qq git curl python3 zstd tar xz-utils file kmod bc \
+            libssl-dev flex bison cpio zip unzip rsync
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo" \
+            && chmod a+rx "$HOME/.local/bin/repo" || echo "官方 repo 下载失败，用 apt 版"
+          export PATH="$HOME/.local/bin:$PATH"; echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          git config --global user.name "canoe-build"; git config --global user.email "build@local"
+          git config --global http.postBuffer 524288000
+          repo --version || true
+          df -h "$WORK"; free -h
+
+      - name: ② repo init（含 kernel-platform 组）+ 注入 qcom 三树 local_manifest
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$WORK/src"; cd "$WORK/src"
+          # 关键：-g 必须包含 kernel-platform 组，否则 Kleaf/common/prebuilts 不会被同步
+          repo init -u "$LOS_MANIFEST" -b "$LOS_BRANCH" \
+            -g default,kernel-platform,kernel-platform-612 --no-clone-bundle
+          mkdir -p .repo/local_manifests
+          cat > .repo/local_manifests/kernel-sm8850.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <include name="$KERNEL_SNIPPET" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850" name="$QCOM_KERNEL" revision="$REPO_BRANCH" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-modules" name="$QCOM_MODULES" revision="$REPO_BRANCH" />
+            <project path="$PLATFORM_DIR/vendor/qcom/sm8850-devicetrees" name="$QCOM_DT" revision="$REPO_BRANCH" />
+          </manifest>
+          EOF
+          echo "=== local_manifest ==="; cat .repo/local_manifests/kernel-sm8850.xml
+          echo "=== 合并后内核平台项目数（应为数十个，含 build/kernel、common、prebuilts）==="
+          repo list 2>/dev/null | grep -c "$PLATFORM_DIR" || true
+          echo "=== 关键项目是否进入清单 ==="
+          repo list 2>/dev/null | grep -E "build/kernel$|/$PLATFORM_DIR/common$|clang/host/linux-x86|vendor/qcom/sm8850$" || \
+            { echo "✗ 关键平台项目未进入 repo list，group/include 未生效"; exit 1; }
+
+      - name: ③ repo sync 内核平台子树 + qcom 三树（自动重试）
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$WORK/src"
+          mapfile -t KP < <(repo list 2>/dev/null | sed 's/ :.*//' | grep "^$PLATFORM_DIR/" || true)
+          echo "待同步项目数: ${#KP[@]}"
+          echo "${KP[@]}" | tr ' ' '\n' | grep -E "build/kernel|/common|prebuilts/clang|external/|vendor/qcom" | head -30
+          n=0
+          until [ "$n" -ge 6 ]; do
+            n=$((n+1)); echo "===== repo sync 第 $n 次 ====="
+            if repo sync -c --no-tags --prune --no-clone-bundle -j"$SYNC_JOBS" --fail-fast "${KP[@]}"; then
+              echo "sync 完成"; break
+            fi
+            echo "第 $n 次未完全成功，10s 后低并发重试…"; sleep 10
+            repo sync -c --no-tags --prune --no-clone-bundle -j2 "${KP[@]}" || true
+          done
+          echo "=== linkfile 检查（tools/bazel 应指向 kleaf/bazel.sh）==="
+          ls -l "$WORK/src/$PLATFORM_DIR/tools/bazel" 2>/dev/null || echo "(tools/bazel linkfile 缺失)"
+
+      - name: ④ 同步结果强校验（缺关键件直接报错，不把问题留到 bazel）
+        run: |
+          set -uo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          miss=0
+          chk() { if [ -e "$1" ]; then echo "  OK  $1"; else echo "  ✗ 缺 $1"; miss=1; fi; }
+          echo "=== common 内核版本（应为 6.12.x）==="
+          grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" common/Makefile 2>/dev/null | head -3
+          echo "=== 必需文件/目录 ==="
+          chk common/Makefile
+          chk build/kernel/kleaf/kleaf.bzl
+          chk build/kernel/kleaf/bazel.sh
+          chk WORKSPACE.bzlmod; chk MODULE.bazel
+          chk prebuilts/clang/host/linux-x86
+          chk vendor/qcom/sm8850/BUILD.bazel
+          chk vendor/qcom/sm8850/kleaf-scripts/targets/canoe.bzl
+          chk vendor/qcom/sm8850-modules/kleaf/repo_paths.bzl
+          chk vendor/qcom/sm8850-modules/qcom/opensource/camera-kernel/BUILD.bazel
+          echo "=== tools/bazel 可执行性 ==="
+          if [ -x tools/bazel ]; then echo "  OK tools/bazel 可用(linkfile)"; else echo "  -- tools/bazel 不可执行，将回退 bazel.sh/bazelisk"; fi
+          [ "$miss" -eq 0 ] || { echo "✗ 平台不完整，多半是 group/sync 未生效，请把本步日志发回"; exit 1; }
+
+      - name: ⑤ 选定 bazel 启动器（优先 Kleaf bazel.sh）并自检目标
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          if [ -x tools/bazel ]; then
+            BAZEL=tools/bazel
+          elif [ -x build/kernel/kleaf/bazel.sh ]; then
+            BAZEL=build/kernel/kleaf/bazel.sh
+          else
+            echo "平台未提供 bazel.sh，最后兜底下载 bazelisk（注意版本可能需与 Kleaf 对齐）"
+            mkdir -p tools
+            curl -fsSL -o tools/bazel https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+            chmod +x tools/bazel; BAZEL=tools/bazel
+          fi
+          echo "BAZEL=$BAZEL"; echo "$BAZEL" > "$WORK/.bazel"
+          "$BAZEL" --version || true
+          echo "=== canoe 相关目标（确认 ${TARGET}_${VARIANT}_dist 存在）==="
+          "$BAZEL" query "//vendor/qcom/sm8850:all" 2>/dev/null | grep -E "${TARGET}_(perf|consolidate)" | grep -E "_dist$" | head -20 \
+            || echo "query 暂不可用（首次会拉 bzlmod 依赖，稍后在构建阶段重试）"
+
+      - name: ⑥ bazel 构建 canoe dist（内核 + in-tree + techpack 外部模块）
+        run: |
+          set -euo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          BAZEL=$(cat "$WORK/.bazel"); mkdir -p "$WORK/bazelcache"
+          T="//vendor/qcom/sm8850:${TARGET}_${VARIANT}_dist"
+          echo "===== bazel build $T (jobs=$BAZEL_JOBS) ====="
+          set +e
+          "$BAZEL" --output_user_root="$WORK/bazelcache" build "$T" \
+            --jobs="$BAZEL_JOBS" --keep_going 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "目标 $T 失败，列出实际可用 dist 目标："
+            "$BAZEL" query "//vendor/qcom/sm8850:all" 2>/dev/null | grep -iE "${TARGET}.*_dist$" | tee -a build.log || true
+          fi
+          exit $rc
+
+      - name: ⑦ 收集 dist 产物 + 报告
+        if: always()
+        run: |
+          set -uo pipefail
+          cd "$WORK/src/$PLATFORM_DIR"
+          mkdir -p "$WORK/artifacts"
+          REPORT="$WORK/artifacts/canoe-los-report.txt"
+          DIST_DIRS=$(find bazel-bin -type d \( -name "${TARGET}_${VARIANT}_dist" -o -name "*${TARGET}_${VARIANT}*dist*" \) 2>/dev/null | head -5)
+          {
+            echo "===== SM8850 canoe · LineageOS 高通树构建报告 ====="
+            echo "时间(UTC): $(date -u)"; echo "target=$TARGET variant=$VARIANT branch=$REPO_BRANCH"
+            echo "平台: $PLATFORM_DIR（common GKI 6.12 + Kleaf，bzlmod）"
+            echo; echo "## common 版本:"; grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" common/Makefile 2>/dev/null | head -3
+            echo; echo "## dist 目录:"; echo "${DIST_DIRS:-(无，构建失败)}"
+            for d in $DIST_DIRS; do
+              echo "---- $d ----"; ls -la "$d" 2>/dev/null | head -80
+              for img in Image Image.gz vmlinux; do [ -f "$d/$img" ] && strings "$d/$img" | grep -m1 "Linux version"; done
+              echo "## .ko 数量: $(find "$d" -name '*.ko' | wc -l)"
+              find "$d" -maxdepth 1 -type f \( -name '*.img' -o -name 'Image*' -o -name '*.dtb' -o -name 'dtbo*' \) -printf '%f  %s bytes\n' 2>/dev/null | sort
+            done
+            [ -z "$DIST_DIRS" ] && { echo "## build.log 尾部:"; tail -80 build.log 2>/dev/null; }
+          } | tee "$REPORT"
+          n=0
+          for d in $DIST_DIRS; do
+            n=$((n+1)); tar -C "$d" -cf - . | zstd -T0 -6 -o "$WORK/artifacts/canoe-los-${TARGET}-${VARIANT}-dist${n}.tar.zst"
+          done
+          cp -f build.log "$WORK/artifacts/" 2>/dev/null || true
+          du -sh "$WORK/artifacts"/* 2>/dev/null || true; ls -lah "$WORK/artifacts"
+
+      - name: ⑧ 上传产物（dist 整包 + 报告 + 日志）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canoe-los-${{ github.event.inputs.target }}-${{ github.event.inputs.variant }}
+          path: /home/runner/los/artifacts/
+          retention-days: 14
+          if-no-files-found: warn
