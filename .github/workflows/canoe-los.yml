@@ -202,7 +202,8 @@ jobs:
           grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL)" common/Makefile 2>/dev/null | head -3
           echo "=== 必需文件/目录 ==="
           chk common/Makefile
-          chk build/kernel/kleaf/kleaf.bzl
+          # bzlmod 版(main-kernel-2025)由 MODULE.bazel 自动加载 Kleaf，没有固定的 kleaf.bzl 属正常，以 bazel.sh 为准
+          echo "  -- kleaf 入口文件(参考) --"; ls build/kernel/kleaf/ 2>/dev/null | grep -iE 'bazel.sh|\.bzl$' | head -8 || true
           chk build/kernel/kleaf/bazel.sh
           chk WORKSPACE.bzlmod; chk MODULE.bazel
           chk prebuilts/clang/host/linux-x86
